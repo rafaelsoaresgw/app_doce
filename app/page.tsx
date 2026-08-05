@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { supabase } from "./supabase";
 
 type Venda = {
   produto: string;
@@ -75,7 +76,23 @@ export default function Home() {
     const { lat, lon } = await pegarLocalizacao();
     const clima = lat && lon ? await buscarClima(lat, lon) : { temperatura: null, chuva: null };
     const bairro = lat && lon ? await buscarBairro(lat, lon) : null;
-    setVendas((atual) => [...atual, { produto, hora, lat, lon, bairro, ...clima }]);
+    const venda = { produto, hora, lat, lon, bairro, ...clima };
+
+    // salva no celular (local)
+    setVendas((atual) => [...atual, venda]);
+
+    // salva na nuvem (Supabase)
+    const { data, error } = await supabase.from("vendas").insert({
+      produto,
+      hora,
+      lat,
+      lon,
+      bairro,
+      temperatura: clima.temperatura,
+      chuva: clima.chuva,
+    }).select();
+    console.log("Supabase resposta:", { data, error });
+    if (error) console.error("Erro ao salvar na nuvem:", error.message);
   }
 
   const brigadeiros = vendas.filter((v) => v.produto === "brigadeiro").length;
