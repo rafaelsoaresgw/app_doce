@@ -11,6 +11,7 @@ type Venda = {
   bairro: string | null;
   temperatura: number | null;
   chuva: number | null;
+  precisao: number | null;
 };
 
 export default function Home() {
@@ -60,12 +61,17 @@ export default function Home() {
     }
   }
 
-  function pegarLocalizacao(): Promise<{ lat: number | null; lon: number | null }> {
+  function pegarLocalizacao(): Promise<{ lat: number | null; lon: number | null; precisao: number | null }> {
     return new Promise((resolve) => {
-      if (!navigator.geolocation) return resolve({ lat: null, lon: null });
+      if (!navigator.geolocation) return resolve({ lat: null, lon: null, precisao: null });
       navigator.geolocation.getCurrentPosition(
-        (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-        () => resolve({ lat: null, lon: null })
+        (pos) => resolve({
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          precisao: pos.coords.accuracy,
+        }),
+        () => resolve({ lat: null, lon: null, precisao: null }),
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
       );
     });
   }
@@ -73,10 +79,10 @@ export default function Home() {
   async function registrar(produto: string) {
     const agora = new Date();
     const hora = agora.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
-    const { lat, lon } = await pegarLocalizacao();
+    const { lat, lon, precisao } = await pegarLocalizacao();
     const clima = lat && lon ? await buscarClima(lat, lon) : { temperatura: null, chuva: null };
     const bairro = lat && lon ? await buscarBairro(lat, lon) : null;
-    const venda = { produto, hora, lat, lon, bairro, ...clima };
+    const venda = { produto, hora, lat, lon, bairro, precisao, ...clima };
 
     // salva no celular (local)
     setVendas((atual) => [...atual, venda]);
@@ -90,6 +96,7 @@ export default function Home() {
       bairro,
       temperatura: clima.temperatura,
       chuva: clima.chuva,
+      precisao,
     }).select();
     console.log("Supabase resposta:", { data, error });
     if (error) console.error("Erro ao salvar na nuvem:", error.message);
@@ -98,7 +105,23 @@ export default function Home() {
   const brigadeiros = vendas.filter((v) => v.produto === "brigadeiro").length;
   const brownies = vendas.filter((v) => v.produto === "brownie").length;
 
-  function encerrarDia() {
+  async function encerrarDia() {
+    const sobrouBrig = levouBrig - brigadeiros;
+    const sobrouBrow = levouBrow - brownies;
+
+    // salva o resumo do dia na nuvem (Supabase)
+    const { error } = await supabase.from("dias").insert({
+      levou_brig: levouBrig,
+      levou_brow: levouBrow,
+      vendeu_brig: brigadeiros,
+      vendeu_brow: brownies,
+      sobrou_brig: sobrouBrig,
+      sobrou_brow: sobrouBrow,
+    });
+    if (error) console.error("Erro ao salvar o dia na nuvem:", error.message);
+    else console.log("Dia salvo na nuvem com sucesso");
+
+    // salva também no celular (histórico local, rede de segurança)
     const historico = JSON.parse(localStorage.getItem("historico") || "[]");
     historico.push({
       data: new Date().toISOString(),
@@ -107,6 +130,8 @@ export default function Home() {
       vendas,
     });
     localStorage.setItem("historico", JSON.stringify(historico));
+
+    // zera pra começar novo dia
     setVendas([]);
     setLevouBrig(0);
     setLevouBrow(0);
