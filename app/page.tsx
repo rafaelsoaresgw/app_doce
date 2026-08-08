@@ -10,6 +10,14 @@ type Venda = {
   data: string;
 };
 
+type LocalConhecido = {
+  lat: number;
+  lon: number;
+  bairro: string | null;
+  tipoArea: string | null;
+  quando: number;
+};
+
 // feriados nacionais do México (mês-dia)
 const FERIADOS_MX = [
   "01-01", "02-05", "03-21", "05-01", "09-16", "11-20", "12-25",
@@ -51,6 +59,7 @@ export default function Home() {
   const [aviso, setAviso] = useState<string | null>(null);
   const [ultimaVenda, setUltimaVenda] = useState<Venda | null>(null);
   const [pendentes, setPendentes] = useState(0);
+  const [ultimoLocal, setUltimoLocal] = useState<LocalConhecido | null>(null);
 
   // ---------- FILA DE REENVIO ----------
   const enviarPendentes = useCallback(async () => {
@@ -215,9 +224,37 @@ export default function Home() {
 
   // ---------- REGISTRO ----------
   async function completarRegistro(venda: Venda, preco: number) {
-    const { lat, lon, precisao } = await pegarLocalizacao();
-    const clima = lat && lon ? await buscarClima(lat, lon) : { temperatura: null, chuva: null };
-    const local = lat && lon ? await buscarLocal(lat, lon) : { bairro: null, tipoArea: null };
+    const pos = await pegarLocalizacao();
+    let lat = pos.lat;
+    let lon = pos.lon;
+    let precisao = pos.precisao;
+    let bairro: string | null = null;
+    let tipoArea: string | null = null;
+    let temperatura: number | null = null;
+    let chuva: number | null = null;
+    let aproximado = false;
+
+    if (lat && lon) {
+      // GPS funcionou
+      const clima = await buscarClima(lat, lon);
+      const local = await buscarLocal(lat, lon);
+      temperatura = clima.temperatura;
+      chuva = clima.chuva;
+      bairro = local.bairro;
+      tipoArea = local.tipoArea;
+      setUltimoLocal({ lat, lon, bairro, tipoArea, quando: Date.now() });
+    } else if (ultimoLocal && Date.now() - ultimoLocal.quando < 30 * 60 * 1000) {
+      // GPS falhou: reaproveita a última localização (até 30 min atrás)
+      lat = ultimoLocal.lat;
+      lon = ultimoLocal.lon;
+      bairro = ultimoLocal.bairro;
+      tipoArea = ultimoLocal.tipoArea;
+      precisao = null;
+      aproximado = true;
+      const clima = await buscarClima(lat, lon);
+      temperatura = clima.temperatura;
+      chuva = clima.chuva;
+    }
 
     const registro = {
       cliente_id: venda.id,
@@ -225,12 +262,10 @@ export default function Home() {
       hora: venda.hora,
       data: venda.data,
       preco,
-      lat, lon,
-      bairro: local.bairro,
-      tipo_area: local.tipoArea,
-      temperatura: clima.temperatura,
-      chuva: clima.chuva,
-      precisao,
+      lat, lon, bairro,
+      tipo_area: tipoArea,
+      temperatura, chuva, precisao,
+      local_aproximado: aproximado,
       feriado: ehFeriado(),
       dia_semana: diaSemana(),
       periodo: periodoDoDia(),
