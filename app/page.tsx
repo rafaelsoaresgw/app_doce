@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { supabase } from "./supabase";
 
 type Venda = {
@@ -18,7 +18,6 @@ type LocalConhecido = {
   quando: number;
 };
 
-// feriados nacionais do México (mês-dia)
 const FERIADOS_MX = [
   "01-01", "02-05", "03-21", "05-01", "09-16", "11-20", "12-25",
   "11-01", "11-02", "12-12", "12-24", "12-31",
@@ -36,15 +35,43 @@ function ehFeriado() {
 }
 
 const DIAS = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
-function diaSemana() {
-  return DIAS[new Date().getDay()];
-}
+function diaSemana() { return DIAS[new Date().getDay()]; }
 
 function periodoDoDia() {
   const h = new Date().getHours();
   if (h < 12) return "manhã";
   if (h < 18) return "tarde";
   return "noite";
+}
+
+function salvarEstadoAgora(dados: Record<string, unknown>) {
+  try {
+    localStorage.setItem("estado", JSON.stringify({ ...dados, data: hojeLocal() }));
+  } catch { /* ignora */ }
+}
+
+// som de moeda gerado no próprio navegador (sem arquivo, funciona offline)
+function tocarMoeda() {
+  try {
+    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new Ctx();
+    const agora = ctx.currentTime;
+
+    [[988, 0], [1319, 0.07]].forEach(([freq, atraso]) => {
+      const osc = ctx.createOscillator();
+      const vol = ctx.createGain();
+      osc.type = "square";
+      osc.frequency.value = freq;
+      osc.connect(vol);
+      vol.connect(ctx.destination);
+      vol.gain.setValueAtTime(0.18, agora + atraso);
+      vol.gain.exponentialRampToValueAtTime(0.001, agora + atraso + 0.25);
+      osc.start(agora + atraso);
+      osc.stop(agora + atraso + 0.25);
+    });
+
+    setTimeout(() => ctx.close(), 600);
+  } catch { /* ignora */ }
 }
 
 export default function Home() {
@@ -59,7 +86,11 @@ export default function Home() {
   const [aviso, setAviso] = useState<string | null>(null);
   const [ultimaVenda, setUltimaVenda] = useState<Venda | null>(null);
   const [pendentes, setPendentes] = useState(0);
-  const [ultimoLocal, setUltimoLocal] = useState<LocalConhecido | null>(null);
+  const [gpsOk, setGpsOk] = useState(true);
+  const ultimoLocal = useRef<LocalConhecido | null>(null);
+
+  const ref = useRef({ vendas, levouBrig, levouBrow, precoBrig, precoBrow });
+  ref.current = { vendas, levouBrig, levouBrow, precoBrig, precoBrow };
 
   // ---------- FILA DE REENVIO ----------
   const enviarPendentes = useCallback(async () => {
@@ -80,6 +111,33 @@ export default function Home() {
     localStorage.setItem("fila", JSON.stringify(fila));
     setPendentes(fila.length);
   }
+
+  // ---------- RECONCILIAÇÃO ----------
+  const reconciliar = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("vendas")
+        .select("cliente_id, produto, hora, data")
+        .eq("data", hojeLocal());
+      if (error || !data) return;
+
+      const doBanco: Venda[] = data.map((v) => ({
+        id: v.cliente_id || `banco-${v.hora}-${Math.random()}`,
+        produto: v.produto,
+        hora: v.hora,
+        data: v.data,
+      }));
+
+      setVendas((locais) => {
+        const mapa = new Map<string, Venda>();
+        for (const v of doBanco) mapa.set(v.id, v);
+        for (const v of locais) mapa.set(v.id, v);
+        const juntas = Array.from(mapa.values());
+        salvarEstadoAgora({ ...ref.current, vendas: juntas });
+        return juntas;
+      });
+    } catch { /* offline: mantém o local */ }
+  }, []);
 
   // ---------- SALVAR DIA ----------
   const salvarDia = useCallback(async (d: {
@@ -120,7 +178,7 @@ export default function Home() {
     localStorage.setItem("filaDias", JSON.stringify(restantes));
   }, []);
 
-  // ---------- AO ABRIR: carrega e verifica virada de dia ----------
+  // ---------- AO ABRIR ----------
   useEffect(() => {
     const salvo = localStorage.getItem("estado");
     const hoje = hojeLocal();
@@ -161,22 +219,37 @@ export default function Home() {
   }, [salvarDia]);
 
   useEffect(() => {
-    if (carregado) {
-      localStorage.setItem("estado", JSON.stringify({
-        vendas, levouBrig, levouBrow, precoBrig, precoBrow, data: hojeLocal(),
-      }));
-    }
+    if (carregado) salvarEstadoAgora({ vendas, levouBrig, levouBrow, precoBrig, precoBrow });
   }, [vendas, levouBrig, levouBrow, precoBrig, precoBrow, carregado]);
 
   useEffect(() => {
     if (!carregado) return;
+    reconciliar();
     enviarPendentes();
     enviarDiasPendentes();
-    const timer = setInterval(() => { enviarPendentes(); enviarDiasPendentes(); }, 30000);
-    const aoVoltar = () => { enviarPendentes(); enviarDiasPendentes(); };
+    const timer = setInterval(() => {
+      enviarPendentes(); enviarDiasPendentes(); reconciliar();
+    }, 60000);
+    const aoVoltar = () => { enviarPendentes(); enviarDiasPendentes(); reconciliar(); };
+    const aoFocar = () => { if (document.visibilityState === "visible") reconciliar(); };
     window.addEventListener("online", aoVoltar);
-    return () => { clearInterval(timer); window.removeEventListener("online", aoVoltar); };
-  }, [carregado, enviarPendentes, enviarDiasPendentes]);
+    document.addEventListener("visibilitychange", aoFocar);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("online", aoVoltar);
+      document.removeEventListener("visibilitychange", aoFocar);
+    };
+  }, [carregado, enviarPendentes, enviarDiasPendentes, reconciliar]);
+
+  useEffect(() => {
+    if (!navigator.permissions) return;
+    navigator.permissions.query({ name: "geolocation" as PermissionName })
+      .then((p) => {
+        setGpsOk(p.state !== "denied");
+        p.onchange = () => setGpsOk(p.state !== "denied");
+      })
+      .catch(() => {});
+  }, []);
 
   // ---------- APIs ----------
   async function buscarClima(lat: number, lon: number) {
@@ -197,14 +270,11 @@ export default function Home() {
       const d = await r.json();
       const e = d.address || {};
       const bairro = e.suburb || e.borough || e.neighbourhood || e.city || null;
-
-      let tipoArea: string | null = null;
+      let tipoArea: string | null = "mista";
       const cat = `${d.category || ""} ${d.type || ""} ${e.shop || ""} ${e.office || ""}`.toLowerCase();
       if (cat.includes("commercial") || cat.includes("retail") || e.shop) tipoArea = "comercial";
       else if (cat.includes("residential") || e.residential) tipoArea = "residencial";
       else if (cat.includes("industrial")) tipoArea = "industrial";
-      else tipoArea = "mista";
-
       return { bairro, tipoArea };
     } catch {
       return { bairro: null, tipoArea: null };
@@ -215,45 +285,47 @@ export default function Home() {
     return new Promise((resolve) => {
       if (!navigator.geolocation) return resolve({ lat: null, lon: null, precisao: null });
       navigator.geolocation.getCurrentPosition(
-        (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, precisao: pos.coords.accuracy }),
-        () => resolve({ lat: null, lon: null, precisao: null }),
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        (pos) => {
+          setGpsOk(true);
+          resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, precisao: pos.coords.accuracy });
+        },
+        (err) => {
+          if (err.code === err.PERMISSION_DENIED) setGpsOk(false);
+          resolve({ lat: null, lon: null, precisao: null });
+        },
+        { enableHighAccuracy: true, timeout: 20000, maximumAge: 60000 }
       );
     });
+  }
+
+  function pedirLocalizacao() {
+    navigator.geolocation.getCurrentPosition(
+      () => { setGpsOk(true); setAviso("Localização ativada!"); setTimeout(() => setAviso(null), 2000); },
+      () => { setGpsOk(false); setAviso("Ative nas configurações do navegador"); setTimeout(() => setAviso(null), 4000); },
+      { enableHighAccuracy: true, timeout: 20000 }
+    );
   }
 
   // ---------- REGISTRO ----------
   async function completarRegistro(venda: Venda, preco: number) {
     const pos = await pegarLocalizacao();
-    let lat = pos.lat;
-    let lon = pos.lon;
-    let precisao = pos.precisao;
-    let bairro: string | null = null;
-    let tipoArea: string | null = null;
-    let temperatura: number | null = null;
-    let chuva: number | null = null;
+    let lat = pos.lat, lon = pos.lon, precisao = pos.precisao;
+    let bairro: string | null = null, tipoArea: string | null = null;
+    let temperatura: number | null = null, chuva: number | null = null;
     let aproximado = false;
 
     if (lat && lon) {
-      // GPS funcionou
       const clima = await buscarClima(lat, lon);
       const local = await buscarLocal(lat, lon);
-      temperatura = clima.temperatura;
-      chuva = clima.chuva;
-      bairro = local.bairro;
-      tipoArea = local.tipoArea;
-      setUltimoLocal({ lat, lon, bairro, tipoArea, quando: Date.now() });
-    } else if (ultimoLocal && Date.now() - ultimoLocal.quando < 30 * 60 * 1000) {
-      // GPS falhou: reaproveita a última localização (até 30 min atrás)
-      lat = ultimoLocal.lat;
-      lon = ultimoLocal.lon;
-      bairro = ultimoLocal.bairro;
-      tipoArea = ultimoLocal.tipoArea;
-      precisao = null;
-      aproximado = true;
+      temperatura = clima.temperatura; chuva = clima.chuva;
+      bairro = local.bairro; tipoArea = local.tipoArea;
+      ultimoLocal.current = { lat, lon, bairro, tipoArea, quando: Date.now() };
+    } else if (ultimoLocal.current && Date.now() - ultimoLocal.current.quando < 30 * 60 * 1000) {
+      lat = ultimoLocal.current.lat; lon = ultimoLocal.current.lon;
+      bairro = ultimoLocal.current.bairro; tipoArea = ultimoLocal.current.tipoArea;
+      precisao = null; aproximado = true;
       const clima = await buscarClima(lat, lon);
-      temperatura = clima.temperatura;
-      chuva = clima.chuva;
+      temperatura = clima.temperatura; chuva = clima.chuva;
     }
 
     const registro = {
@@ -261,8 +333,7 @@ export default function Home() {
       produto: venda.produto,
       hora: venda.hora,
       data: venda.data,
-      preco,
-      lat, lon, bairro,
+      preco, lat, lon, bairro,
       tipo_area: tipoArea,
       temperatura, chuva, precisao,
       local_aproximado: aproximado,
@@ -283,13 +354,18 @@ export default function Home() {
       produto, hora, data: hojeLocal(),
     };
 
-    setVendas((atual) => [...atual, venda]);
-    if (navigator.vibrate) navigator.vibrate(100);
+    setVendas((atual) => {
+      const novas = [...atual, venda];
+      salvarEstadoAgora({ ...ref.current, vendas: novas });
+      return novas;
+    });
 
+    tocarMoeda();
+    if (navigator.vibrate) navigator.vibrate(100);
     const nome = produto === "brigadeiro" ? "Brigadeiro" : "Brownie";
     setAviso(`${nome} registrado!`);
     setUltimaVenda(venda);
-    setTimeout(() => setAviso(null), 2500);
+    setTimeout(() => setAviso(null), 2000);
     setTimeout(() => setUltimaVenda((u) => (u?.id === venda.id ? null : u)), 6000);
 
     completarRegistro(venda, produto === "brigadeiro" ? precoBrig : precoBrow);
@@ -298,7 +374,11 @@ export default function Home() {
   async function desfazer() {
     if (!ultimaVenda) return;
     const id = ultimaVenda.id;
-    setVendas((atual) => atual.filter((v) => v.id !== id));
+    setVendas((atual) => {
+      const novas = atual.filter((v) => v.id !== id);
+      salvarEstadoAgora({ ...ref.current, vendas: novas });
+      return novas;
+    });
     setUltimaVenda(null);
     setAviso("Desfeito");
     setTimeout(() => setAviso(null), 1500);
@@ -308,7 +388,6 @@ export default function Home() {
     const novaFila = fila.filter((f: { cliente_id?: string }) => f.cliente_id !== id);
     localStorage.setItem("fila", JSON.stringify(novaFila));
     setPendentes(novaFila.length);
-
     await supabase.from("vendas").delete().eq("cliente_id", id);
   }
 
@@ -322,16 +401,14 @@ export default function Home() {
       levouBrig, levouBrow,
       vBrig: brigadeiros, vBrow: brownies,
       pBrig: precoBrig, pBrow: precoBrow,
-      feriado: ehFeriado(),
-      dia: diaSemana(),
+      feriado: ehFeriado(), dia: diaSemana(),
     });
-    setVendas([]);
-    setLevouBrig(0);
-    setLevouBrow(0);
+    setVendas([]); setLevouBrig(0); setLevouBrow(0);
+    salvarEstadoAgora({ vendas: [], levouBrig: 0, levouBrow: 0, precoBrig, precoBrow });
     setMostrarBalanco(false);
   }
 
-  // ---------- TELA DE CONFIGURAÇÃO ----------
+  // ---------- TELAS ----------
   if (mostrarConfig) {
     return (
       <main className="min-h-screen bg-neutral-950 text-white flex flex-col items-center justify-center gap-6 p-6">
@@ -342,14 +419,10 @@ export default function Home() {
             <span>🍫 Brigadeiro</span>
             <div className="flex items-center gap-2">
               <button onClick={() => setPrecoBrig(Math.max(0, precoBrig - 1))} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">−</button>
-              <input
-                type="number"
-                inputMode="numeric"
-                value={precoBrig}
+              <input type="number" inputMode="numeric" value={precoBrig}
                 onChange={(e) => setPrecoBrig(Math.max(0, parseInt(e.target.value) || 0))}
                 onFocus={(e) => e.target.select()}
-                className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg"
-              />
+                className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg" />
               <button onClick={() => setPrecoBrig(precoBrig + 1)} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">+</button>
             </div>
           </div>
@@ -357,21 +430,15 @@ export default function Home() {
             <span>🍰 Brownie</span>
             <div className="flex items-center gap-2">
               <button onClick={() => setPrecoBrow(Math.max(0, precoBrow - 1))} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">−</button>
-              <input
-                type="number"
-                inputMode="numeric"
-                value={precoBrow}
+              <input type="number" inputMode="numeric" value={precoBrow}
                 onChange={(e) => setPrecoBrow(Math.max(0, parseInt(e.target.value) || 0))}
                 onFocus={(e) => e.target.select()}
-                className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg"
-              />
+                className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg" />
               <button onClick={() => setPrecoBrow(precoBrow + 1)} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">+</button>
             </div>
           </div>
         </div>
-        <button onClick={() => setMostrarConfig(false)} className="w-full max-w-sm bg-green-700 rounded-2xl py-4 text-lg font-bold">
-          Salvar
-        </button>
+        <button onClick={() => setMostrarConfig(false)} className="w-full max-w-sm bg-green-700 rounded-2xl py-4 text-lg font-bold">Salvar</button>
       </main>
     );
   }
@@ -390,16 +457,14 @@ export default function Home() {
           <div className="flex justify-between"><span>Total vendido</span><span>{vendas.length} doces</span></div>
           <div className="flex justify-between text-xl font-bold text-green-400"><span>Faturamento</span><span>${faturamento}</span></div>
         </div>
-        <button onClick={encerrarDia} className="w-full max-w-sm bg-green-700 active:bg-green-800 rounded-2xl py-5 text-xl font-bold">
-          ✓ Confirmar e começar novo dia
-        </button>
+        <button onClick={encerrarDia} className="w-full max-w-sm bg-green-700 active:bg-green-800 rounded-2xl py-5 text-xl font-bold">✓ Confirmar e começar novo dia</button>
         <button onClick={() => setMostrarBalanco(false)} className="text-neutral-400 underline">Voltar</button>
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-neutral-950 text-white flex flex-col items-center gap-6 p-6">
+    <main className="min-h-screen bg-neutral-950 text-white flex flex-col items-center gap-5 p-6">
       <div className="w-full max-w-sm flex justify-between items-center mt-4">
         <h1 className="text-3xl font-bold">Vendas de hoje</h1>
         <button onClick={() => setMostrarConfig(true)} className="text-neutral-500 text-2xl">⚙</button>
@@ -411,20 +476,23 @@ export default function Home() {
         </div>
       )}
 
+      {!gpsOk && (
+        <button onClick={pedirLocalizacao} className="w-full max-w-sm bg-red-900/60 border border-red-500 rounded-2xl py-3 px-4 text-center">
+          <span className="text-red-200 font-bold">📍 Localização desativada</span>
+          <div className="text-red-300 text-sm mt-1">Toque aqui para ativar</div>
+        </button>
+      )}
+
       <div className="w-full max-w-sm bg-neutral-900 rounded-2xl p-4">
         <p className="text-center text-neutral-400 mb-3">Quanto levei hoje?</p>
         <div className="flex justify-between items-center mb-3">
           <span>🍫 Brigadeiros</span>
           <div className="flex items-center gap-2">
             <button onClick={() => setLevouBrig(Math.max(0, levouBrig - 1))} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">−</button>
-            <input
-              type="number"
-              inputMode="numeric"
-              value={levouBrig}
+            <input type="number" inputMode="numeric" value={levouBrig}
               onChange={(e) => setLevouBrig(Math.max(0, parseInt(e.target.value) || 0))}
               onFocus={(e) => e.target.select()}
-              className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg"
-            />
+              className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg" />
             <button onClick={() => setLevouBrig(levouBrig + 1)} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">+</button>
           </div>
         </div>
@@ -432,14 +500,10 @@ export default function Home() {
           <span>🍰 Brownies</span>
           <div className="flex items-center gap-2">
             <button onClick={() => setLevouBrow(Math.max(0, levouBrow - 1))} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">−</button>
-            <input
-              type="number"
-              inputMode="numeric"
-              value={levouBrow}
+            <input type="number" inputMode="numeric" value={levouBrow}
               onChange={(e) => setLevouBrow(Math.max(0, parseInt(e.target.value) || 0))}
               onFocus={(e) => e.target.select()}
-              className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg"
-            />
+              className="w-16 h-10 text-center text-xl font-bold bg-neutral-800 rounded-lg" />
             <button onClick={() => setLevouBrow(levouBrow + 1)} className="bg-neutral-700 w-10 h-10 rounded-full text-xl">+</button>
           </div>
         </div>
@@ -467,9 +531,7 @@ export default function Home() {
       </div>
 
       {pendentes > 0 && (
-        <p className="text-amber-500 text-sm">
-          {pendentes} venda(s) aguardando internet — serão enviadas sozinhas
-        </p>
+        <p className="text-amber-500 text-sm">{pendentes} venda(s) aguardando internet</p>
       )}
 
       <button onClick={() => setMostrarBalanco(true)} className="w-full max-w-sm border border-neutral-600 rounded-2xl py-4 text-lg mt-2">
