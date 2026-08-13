@@ -50,13 +50,27 @@ function salvarEstadoAgora(dados: Record<string, unknown>) {
   } catch { /* ignora */ }
 }
 
-// som de moeda gerado no próprio navegador (sem arquivo, funciona offline)
+// marca/consulta se um dia já foi encerrado
+function diaEncerrado(data: string) {
+  try {
+    const lista = JSON.parse(localStorage.getItem("diasEncerrados") || "[]");
+    return lista.includes(data);
+  } catch { return false; }
+}
+
+function marcarDiaEncerrado(data: string) {
+  try {
+    const lista = JSON.parse(localStorage.getItem("diasEncerrados") || "[]");
+    if (!lista.includes(data)) lista.push(data);
+    localStorage.setItem("diasEncerrados", JSON.stringify(lista.slice(-30)));
+  } catch { /* ignora */ }
+}
+
 function tocarMoeda() {
   try {
     const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const ctx = new Ctx();
     const agora = ctx.currentTime;
-
     [[988, 0], [1319, 0.07]].forEach(([freq, atraso]) => {
       const osc = ctx.createOscillator();
       const vol = ctx.createGain();
@@ -69,7 +83,6 @@ function tocarMoeda() {
       osc.start(agora + atraso);
       osc.stop(agora + atraso + 0.25);
     });
-
     setTimeout(() => ctx.close(), 600);
   } catch { /* ignora */ }
 }
@@ -87,6 +100,8 @@ export default function Home() {
   const [ultimaVenda, setUltimaVenda] = useState<Venda | null>(null);
   const [pendentes, setPendentes] = useState(0);
   const [gpsOk, setGpsOk] = useState(true);
+  const [encerrando, setEncerrando] = useState(false);
+  const [encerrado, setEncerrado] = useState(false);
   const ultimoLocal = useRef<LocalConhecido | null>(null);
 
   const ref = useRef({ vendas, levouBrig, levouBrow, precoBrig, precoBrow });
@@ -112,13 +127,15 @@ export default function Home() {
     setPendentes(fila.length);
   }
 
-  // ---------- RECONCILIAÇÃO ----------
+  // ---------- RECONCILIAÇÃO (não roda se o dia foi encerrado) ----------
   const reconciliar = useCallback(async () => {
+    const hoje = hojeLocal();
+    if (diaEncerrado(hoje)) return;   // <-- não traz vendas de dia já fechado
     try {
       const { data, error } = await supabase
         .from("vendas")
         .select("cliente_id, produto, hora, data")
-        .eq("data", hojeLocal());
+        .eq("data", hoje);
       if (error || !data) return;
 
       const doBanco: Venda[] = data.map((v) => ({
@@ -136,15 +153,16 @@ export default function Home() {
         salvarEstadoAgora({ ...ref.current, vendas: juntas });
         return juntas;
       });
-    } catch { /* offline: mantém o local */ }
+    } catch { /* offline */ }
   }, []);
 
-  // ---------- SALVAR DIA ----------
+  // ---------- SALVAR DIA (upsert: nunca duplica) ----------
   const salvarDia = useCallback(async (d: {
     data: string; levouBrig: number; levouBrow: number;
     vBrig: number; vBrow: number; pBrig: number; pBrow: number;
     feriado: boolean; dia: string;
   }) => {
+    if (diaEncerrado(d.data)) return true;   // já foi salvo antes
     const registro = {
       data: d.data,
       levou_brig: d.levouBrig,
@@ -159,12 +177,16 @@ export default function Home() {
       feriado: d.feriado,
       dia_semana: d.dia,
     };
-    const { error } = await supabase.from("dias").insert(registro);
+    // upsert: se já existe linha com essa data, atualiza em vez de criar outra
+    const { error } = await supabase.from("dias").upsert(registro, { onConflict: "data" });
     if (error) {
       const filaDias = JSON.parse(localStorage.getItem("filaDias") || "[]");
       filaDias.push(registro);
       localStorage.setItem("filaDias", JSON.stringify(filaDias));
+      return false;
     }
+    marcarDiaEncerrado(d.data);
+    return true;
   }, []);
 
   const enviarDiasPendentes = useCallback(async () => {
@@ -172,8 +194,9 @@ export default function Home() {
     if (fila.length === 0) return;
     const restantes = [];
     for (const item of fila) {
-      const { error } = await supabase.from("dias").insert(item);
+      const { error } = await supabase.from("dias").upsert(item, { onConflict: "data" });
       if (error) restantes.push(item);
+      else marcarDiaEncerrado(item.data);
     }
     localStorage.setItem("filaDias", JSON.stringify(restantes));
   }, []);
@@ -182,6 +205,7 @@ export default function Home() {
   useEffect(() => {
     const salvo = localStorage.getItem("estado");
     const hoje = hojeLocal();
+    setEncerrado(diaEncerrado(hoje));
 
     if (salvo) {
       const e = JSON.parse(salvo);
@@ -190,10 +214,11 @@ export default function Home() {
       if (e.precoBrow != null) setPrecoBrow(e.precoBrow);
 
       if (dataSalva !== hoje) {
+        // virou o dia: encerra o anterior (se ainda não foi encerrado)
         const vendasAntigas: Venda[] = e.vendas || [];
         const vBrig = vendasAntigas.filter((v) => v.produto === "brigadeiro").length;
         const vBrow = vendasAntigas.filter((v) => v.produto === "brownie").length;
-        if (vendasAntigas.length > 0 || e.levouBrig > 0 || e.levouBrow > 0) {
+        if (!diaEncerrado(dataSalva) && (vendasAntigas.length > 0 || e.levouBrig > 0 || e.levouBrow > 0)) {
           salvarDia({
             data: dataSalva,
             levouBrig: e.levouBrig || 0,
@@ -208,7 +233,8 @@ export default function Home() {
         setVendas([]);
         setLevouBrig(0);
         setLevouBrow(0);
-      } else {
+        setEncerrado(false);
+      } else if (!diaEncerrado(hoje)) {
         setVendas(e.vendas || []);
         setLevouBrig(e.levouBrig || 0);
         setLevouBrow(e.levouBrow || 0);
@@ -396,7 +422,9 @@ export default function Home() {
   const faturamento = brigadeiros * precoBrig + brownies * precoBrow;
 
   async function encerrarDia() {
-    await salvarDia({
+    if (encerrando) return;           // bloqueia duplo toque
+    setEncerrando(true);
+    const ok = await salvarDia({
       data: hojeLocal(),
       levouBrig, levouBrow,
       vBrig: brigadeiros, vBrow: brownies,
@@ -405,7 +433,11 @@ export default function Home() {
     });
     setVendas([]); setLevouBrig(0); setLevouBrow(0);
     salvarEstadoAgora({ vendas: [], levouBrig: 0, levouBrow: 0, precoBrig, precoBrow });
+    setEncerrado(true);
     setMostrarBalanco(false);
+    setEncerrando(false);
+    setAviso(ok ? "Dia encerrado!" : "Salvo no celular, enviaremos depois");
+    setTimeout(() => setAviso(null), 2500);
   }
 
   // ---------- TELAS ----------
@@ -457,7 +489,10 @@ export default function Home() {
           <div className="flex justify-between"><span>Total vendido</span><span>{vendas.length} doces</span></div>
           <div className="flex justify-between text-xl font-bold text-green-400"><span>Faturamento</span><span>${faturamento}</span></div>
         </div>
-        <button onClick={encerrarDia} className="w-full max-w-sm bg-green-700 active:bg-green-800 rounded-2xl py-5 text-xl font-bold">✓ Confirmar e começar novo dia</button>
+        <button onClick={encerrarDia} disabled={encerrando}
+          className="w-full max-w-sm bg-green-700 active:bg-green-800 disabled:opacity-50 rounded-2xl py-5 text-xl font-bold">
+          {encerrando ? "Salvando..." : "✓ Confirmar e começar novo dia"}
+        </button>
         <button onClick={() => setMostrarBalanco(false)} className="text-neutral-400 underline">Voltar</button>
       </main>
     );
@@ -473,6 +508,13 @@ export default function Home() {
       {aviso && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-green-600 text-white px-6 py-3 rounded-full text-lg font-bold shadow-lg">
           ✓ {aviso}
+        </div>
+      )}
+
+      {encerrado && (
+        <div className="w-full max-w-sm bg-green-900/40 border border-green-600 rounded-2xl py-3 px-4 text-center">
+          <span className="text-green-300 font-bold">Dia já encerrado</span>
+          <div className="text-green-400 text-sm mt-1">Novos registros contam para hoje</div>
         </div>
       )}
 
