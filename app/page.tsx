@@ -3,19 +3,19 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { supabase } from "./supabase";
 
-type Venda = {
-  id: string;
-  produto: string;
-  hora: string;
-  data: string;
-};
+type Venda = { id: string; produto: string; hora: string; data: string };
 
 type LocalConhecido = {
-  lat: number;
-  lon: number;
-  bairro: string | null;
-  tipoArea: string | null;
-  quando: number;
+  lat: number; lon: number; bairro: string | null; tipoArea: string | null; quando: number;
+};
+
+type Recomendacao = {
+  brownies: number;
+  brigadeiros: number;
+  mediaBrow: number;
+  diasBase: number;
+  melhorBairro: string | null;
+  confianca: "baixa" | "media" | "boa";
 };
 
 const FERIADOS_MX = [
@@ -50,11 +50,9 @@ function salvarEstadoAgora(dados: Record<string, unknown>) {
   } catch { /* ignora */ }
 }
 
-// marca/consulta se um dia já foi encerrado
 function diaEncerrado(data: string) {
   try {
-    const lista = JSON.parse(localStorage.getItem("diasEncerrados") || "[]");
-    return lista.includes(data);
+    return JSON.parse(localStorage.getItem("diasEncerrados") || "[]").includes(data);
   } catch { return false; }
 }
 
@@ -76,12 +74,10 @@ function tocarMoeda() {
       const vol = ctx.createGain();
       osc.type = "square";
       osc.frequency.value = freq;
-      osc.connect(vol);
-      vol.connect(ctx.destination);
+      osc.connect(vol); vol.connect(ctx.destination);
       vol.gain.setValueAtTime(0.18, agora + atraso);
       vol.gain.exponentialRampToValueAtTime(0.001, agora + atraso + 0.25);
-      osc.start(agora + atraso);
-      osc.stop(agora + atraso + 0.25);
+      osc.start(agora + atraso); osc.stop(agora + atraso + 0.25);
     });
     setTimeout(() => ctx.close(), 600);
   } catch { /* ignora */ }
@@ -102,10 +98,60 @@ export default function Home() {
   const [gpsOk, setGpsOk] = useState(true);
   const [encerrando, setEncerrando] = useState(false);
   const [encerrado, setEncerrado] = useState(false);
+  const [rec, setRec] = useState<Recomendacao | null>(null);
   const ultimoLocal = useRef<LocalConhecido | null>(null);
 
   const ref = useRef({ vendas, levouBrig, levouBrow, precoBrig, precoBrow });
   ref.current = { vendas, levouBrig, levouBrow, precoBrig, precoBrow };
+
+  // ---------- RECOMENDAÇÃO (calculada do histórico real) ----------
+  const calcularRecomendacao = useCallback(async () => {
+    try {
+      const hoje = hojeLocal();
+      const dia = diaSemana();
+
+      const { data: dias } = await supabase
+        .from("dias")
+        .select("data, dia_semana, vendeu_brow, vendeu_brig, levou_brow")
+        .neq("data", hoje);
+      if (!dias || dias.length === 0) return;
+
+      const validos = dias.filter((d) => (d.levou_brow ?? 0) > 0);
+      const doDia = validos.filter((d) => d.dia_semana === dia);
+      const base = doDia.length >= 2 ? doDia : validos;
+
+      const vals = base.map((d) => d.vendeu_brow ?? 0);
+      const media = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const desvio = Math.sqrt(vals.reduce((s, x) => s + (x - media) ** 2, 0) / vals.length) || 3;
+      const sugerido = Math.round(media + 0.7 * desvio);
+
+      const valsBrig = base.map((d) => d.vendeu_brig ?? 0);
+      const mediaBrig = valsBrig.reduce((a, b) => a + b, 0) / valsBrig.length;
+
+      // melhor bairro nesse dia da semana
+      let melhorBairro: string | null = null;
+      const { data: vendasHist } = await supabase
+        .from("vendas")
+        .select("bairro, dia_semana")
+        .eq("dia_semana", dia)
+        .not("bairro", "is", null);
+      if (vendasHist && vendasHist.length > 5) {
+        const contagem: Record<string, number> = {};
+        for (const v of vendasHist) if (v.bairro) contagem[v.bairro] = (contagem[v.bairro] || 0) + 1;
+        const top = Object.entries(contagem).sort((a, b) => b[1] - a[1])[0];
+        if (top) melhorBairro = top[0];
+      }
+
+      setRec({
+        brownies: sugerido,
+        brigadeiros: mediaBrig > 1 ? Math.round(mediaBrig * 1.2) : 0,
+        mediaBrow: Math.round(media),
+        diasBase: doDia.length,
+        melhorBairro,
+        confianca: doDia.length >= 6 ? "boa" : doDia.length >= 3 ? "media" : "baixa",
+      });
+    } catch { /* sem histórico: não mostra nada */ }
+  }, []);
 
   // ---------- FILA DE REENVIO ----------
   const enviarPendentes = useCallback(async () => {
@@ -127,24 +173,18 @@ export default function Home() {
     setPendentes(fila.length);
   }
 
-  // ---------- RECONCILIAÇÃO (não roda se o dia foi encerrado) ----------
+  // ---------- RECONCILIAÇÃO ----------
   const reconciliar = useCallback(async () => {
     const hoje = hojeLocal();
-    if (diaEncerrado(hoje)) return;   // <-- não traz vendas de dia já fechado
+    if (diaEncerrado(hoje)) return;
     try {
       const { data, error } = await supabase
-        .from("vendas")
-        .select("cliente_id, produto, hora, data")
-        .eq("data", hoje);
+        .from("vendas").select("cliente_id, produto, hora, data").eq("data", hoje);
       if (error || !data) return;
-
       const doBanco: Venda[] = data.map((v) => ({
         id: v.cliente_id || `banco-${v.hora}-${Math.random()}`,
-        produto: v.produto,
-        hora: v.hora,
-        data: v.data,
+        produto: v.produto, hora: v.hora, data: v.data,
       }));
-
       setVendas((locais) => {
         const mapa = new Map<string, Venda>();
         for (const v of doBanco) mapa.set(v.id, v);
@@ -156,28 +196,22 @@ export default function Home() {
     } catch { /* offline */ }
   }, []);
 
-  // ---------- SALVAR DIA (upsert: nunca duplica) ----------
+  // ---------- SALVAR DIA ----------
   const salvarDia = useCallback(async (d: {
     data: string; levouBrig: number; levouBrow: number;
     vBrig: number; vBrow: number; pBrig: number; pBrow: number;
     feriado: boolean; dia: string;
   }) => {
-    if (diaEncerrado(d.data)) return true;   // já foi salvo antes
+    if (diaEncerrado(d.data)) return true;
     const registro = {
       data: d.data,
-      levou_brig: d.levouBrig,
-      levou_brow: d.levouBrow,
-      vendeu_brig: d.vBrig,
-      vendeu_brow: d.vBrow,
-      sobrou_brig: d.levouBrig - d.vBrig,
-      sobrou_brow: d.levouBrow - d.vBrow,
-      preco_brig: d.pBrig,
-      preco_brow: d.pBrow,
+      levou_brig: d.levouBrig, levou_brow: d.levouBrow,
+      vendeu_brig: d.vBrig, vendeu_brow: d.vBrow,
+      sobrou_brig: d.levouBrig - d.vBrig, sobrou_brow: d.levouBrow - d.vBrow,
+      preco_brig: d.pBrig, preco_brow: d.pBrow,
       faturamento: d.vBrig * d.pBrig + d.vBrow * d.pBrow,
-      feriado: d.feriado,
-      dia_semana: d.dia,
+      feriado: d.feriado, dia_semana: d.dia,
     };
-    // upsert: se já existe linha com essa data, atualiza em vez de criar outra
     const { error } = await supabase.from("dias").upsert(registro, { onConflict: "data" });
     if (error) {
       const filaDias = JSON.parse(localStorage.getItem("filaDias") || "[]");
@@ -195,8 +229,7 @@ export default function Home() {
     const restantes = [];
     for (const item of fila) {
       const { error } = await supabase.from("dias").upsert(item, { onConflict: "data" });
-      if (error) restantes.push(item);
-      else marcarDiaEncerrado(item.data);
+      if (error) restantes.push(item); else marcarDiaEncerrado(item.data);
     }
     localStorage.setItem("filaDias", JSON.stringify(restantes));
   }, []);
@@ -214,26 +247,18 @@ export default function Home() {
       if (e.precoBrow != null) setPrecoBrow(e.precoBrow);
 
       if (dataSalva !== hoje) {
-        // virou o dia: encerra o anterior (se ainda não foi encerrado)
         const vendasAntigas: Venda[] = e.vendas || [];
         const vBrig = vendasAntigas.filter((v) => v.produto === "brigadeiro").length;
         const vBrow = vendasAntigas.filter((v) => v.produto === "brownie").length;
         if (!diaEncerrado(dataSalva) && (vendasAntigas.length > 0 || e.levouBrig > 0 || e.levouBrow > 0)) {
           salvarDia({
             data: dataSalva,
-            levouBrig: e.levouBrig || 0,
-            levouBrow: e.levouBrow || 0,
-            vBrig, vBrow,
-            pBrig: e.precoBrig ?? 20,
-            pBrow: e.precoBrow ?? 35,
-            feriado: false,
-            dia: "",
+            levouBrig: e.levouBrig || 0, levouBrow: e.levouBrow || 0,
+            vBrig, vBrow, pBrig: e.precoBrig ?? 20, pBrow: e.precoBrow ?? 35,
+            feriado: false, dia: "",
           });
         }
-        setVendas([]);
-        setLevouBrig(0);
-        setLevouBrow(0);
-        setEncerrado(false);
+        setVendas([]); setLevouBrig(0); setLevouBrow(0); setEncerrado(false);
       } else if (!diaEncerrado(hoje)) {
         setVendas(e.vendas || []);
         setLevouBrig(e.levouBrig || 0);
@@ -250,12 +275,8 @@ export default function Home() {
 
   useEffect(() => {
     if (!carregado) return;
-    reconciliar();
-    enviarPendentes();
-    enviarDiasPendentes();
-    const timer = setInterval(() => {
-      enviarPendentes(); enviarDiasPendentes(); reconciliar();
-    }, 60000);
+    reconciliar(); enviarPendentes(); enviarDiasPendentes(); calcularRecomendacao();
+    const timer = setInterval(() => { enviarPendentes(); enviarDiasPendentes(); reconciliar(); }, 60000);
     const aoVoltar = () => { enviarPendentes(); enviarDiasPendentes(); reconciliar(); };
     const aoFocar = () => { if (document.visibilityState === "visible") reconciliar(); };
     window.addEventListener("online", aoVoltar);
@@ -265,7 +286,7 @@ export default function Home() {
       window.removeEventListener("online", aoVoltar);
       document.removeEventListener("visibilitychange", aoFocar);
     };
-  }, [carregado, enviarPendentes, enviarDiasPendentes, reconciliar]);
+  }, [carregado, enviarPendentes, enviarDiasPendentes, reconciliar, calcularRecomendacao]);
 
   useEffect(() => {
     if (!navigator.permissions) return;
@@ -273,28 +294,23 @@ export default function Home() {
       .then((p) => {
         setGpsOk(p.state !== "denied");
         p.onchange = () => setGpsOk(p.state !== "denied");
-      })
-      .catch(() => {});
+      }).catch(() => {});
   }, []);
 
   // ---------- APIs ----------
   async function buscarClima(lat: number, lon: number) {
     try {
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation`;
-      const r = await fetch(url);
-      const d = await r.json();
+      const r = await fetch(url); const d = await r.json();
       return { temperatura: d.current.temperature_2m, chuva: d.current.precipitation };
-    } catch {
-      return { temperatura: null, chuva: null };
-    }
+    } catch { return { temperatura: null, chuva: null }; }
   }
 
   async function buscarLocal(lat: number, lon: number) {
     try {
       const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=16&extratags=1`;
       const r = await fetch(url, { headers: { "Accept-Language": "pt" } });
-      const d = await r.json();
-      const e = d.address || {};
+      const d = await r.json(); const e = d.address || {};
       const bairro = e.suburb || e.borough || e.neighbourhood || e.city || null;
       let tipoArea: string | null = "mista";
       const cat = `${d.category || ""} ${d.type || ""} ${e.shop || ""} ${e.office || ""}`.toLowerCase();
@@ -302,23 +318,15 @@ export default function Home() {
       else if (cat.includes("residential") || e.residential) tipoArea = "residencial";
       else if (cat.includes("industrial")) tipoArea = "industrial";
       return { bairro, tipoArea };
-    } catch {
-      return { bairro: null, tipoArea: null };
-    }
+    } catch { return { bairro: null, tipoArea: null }; }
   }
 
   function pegarLocalizacao(): Promise<{ lat: number | null; lon: number | null; precisao: number | null }> {
     return new Promise((resolve) => {
       if (!navigator.geolocation) return resolve({ lat: null, lon: null, precisao: null });
       navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setGpsOk(true);
-          resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, precisao: pos.coords.accuracy });
-        },
-        (err) => {
-          if (err.code === err.PERMISSION_DENIED) setGpsOk(false);
-          resolve({ lat: null, lon: null, precisao: null });
-        },
+        (pos) => { setGpsOk(true); resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, precisao: pos.coords.accuracy }); },
+        (err) => { if (err.code === err.PERMISSION_DENIED) setGpsOk(false); resolve({ lat: null, lon: null, precisao: null }); },
         { enableHighAccuracy: true, timeout: 20000, maximumAge: 60000 }
       );
     });
@@ -355,19 +363,11 @@ export default function Home() {
     }
 
     const registro = {
-      cliente_id: venda.id,
-      produto: venda.produto,
-      hora: venda.hora,
-      data: venda.data,
-      preco, lat, lon, bairro,
-      tipo_area: tipoArea,
-      temperatura, chuva, precisao,
-      local_aproximado: aproximado,
-      feriado: ehFeriado(),
-      dia_semana: diaSemana(),
-      periodo: periodoDoDia(),
+      cliente_id: venda.id, produto: venda.produto, hora: venda.hora, data: venda.data,
+      preco, lat, lon, bairro, tipo_area: tipoArea,
+      temperatura, chuva, precisao, local_aproximado: aproximado,
+      feriado: ehFeriado(), dia_semana: diaSemana(), periodo: periodoDoDia(),
     };
-
     const { error } = await supabase.from("vendas").insert(registro);
     if (error) adicionarNaFila(registro);
   }
@@ -379,13 +379,11 @@ export default function Home() {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       produto, hora, data: hojeLocal(),
     };
-
     setVendas((atual) => {
       const novas = [...atual, venda];
       salvarEstadoAgora({ ...ref.current, vendas: novas });
       return novas;
     });
-
     tocarMoeda();
     if (navigator.vibrate) navigator.vibrate(100);
     const nome = produto === "brigadeiro" ? "Brigadeiro" : "Brownie";
@@ -393,7 +391,6 @@ export default function Home() {
     setUltimaVenda(venda);
     setTimeout(() => setAviso(null), 2000);
     setTimeout(() => setUltimaVenda((u) => (u?.id === venda.id ? null : u)), 6000);
-
     completarRegistro(venda, produto === "brigadeiro" ? precoBrig : precoBrow);
   }
 
@@ -405,11 +402,9 @@ export default function Home() {
       salvarEstadoAgora({ ...ref.current, vendas: novas });
       return novas;
     });
-    setUltimaVenda(null);
-    setAviso("Desfeito");
+    setUltimaVenda(null); setAviso("Desfeito");
     setTimeout(() => setAviso(null), 1500);
     if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
-
     const fila = JSON.parse(localStorage.getItem("fila") || "[]");
     const novaFila = fila.filter((f: { cliente_id?: string }) => f.cliente_id !== id);
     localStorage.setItem("fila", JSON.stringify(novaFila));
@@ -422,20 +417,17 @@ export default function Home() {
   const faturamento = brigadeiros * precoBrig + brownies * precoBrow;
 
   async function encerrarDia() {
-    if (encerrando) return;           // bloqueia duplo toque
+    if (encerrando) return;
     setEncerrando(true);
     const ok = await salvarDia({
-      data: hojeLocal(),
-      levouBrig, levouBrow,
+      data: hojeLocal(), levouBrig, levouBrow,
       vBrig: brigadeiros, vBrow: brownies,
       pBrig: precoBrig, pBrow: precoBrow,
       feriado: ehFeriado(), dia: diaSemana(),
     });
     setVendas([]); setLevouBrig(0); setLevouBrow(0);
     salvarEstadoAgora({ vendas: [], levouBrig: 0, levouBrow: 0, precoBrig, precoBrow });
-    setEncerrado(true);
-    setMostrarBalanco(false);
-    setEncerrando(false);
+    setEncerrado(true); setMostrarBalanco(false); setEncerrando(false);
     setAviso(ok ? "Dia encerrado!" : "Salvo no celular, enviaremos depois");
     setTimeout(() => setAviso(null), 2500);
   }
@@ -511,10 +503,35 @@ export default function Home() {
         </div>
       )}
 
+      {/* RECOMENDAÇÃO DO DIA */}
+      {rec && levouBrow === 0 && !encerrado && (
+        <div className="w-full max-w-sm bg-gradient-to-br from-indigo-900/70 to-purple-900/50 border border-indigo-500 rounded-2xl p-4">
+          <p className="text-indigo-300 text-sm">Sugestão para hoje · {diaSemana()}</p>
+          <p className="text-3xl font-bold mt-1">Leve {rec.brownies} brownies</p>
+          {rec.brigadeiros > 0 && (
+            <p className="text-xl font-bold text-indigo-200">e {rec.brigadeiros} brigadeiros</p>
+          )}
+          <p className="text-indigo-300 text-sm mt-2">
+            Nas {diaSemana().toLowerCase()}s você vende ~{rec.mediaBrow}
+            {rec.diasBase > 0 && ` (${rec.diasBase} ${rec.diasBase === 1 ? "dia" : "dias"} no histórico)`}
+          </p>
+          {rec.melhorBairro && (
+            <p className="text-indigo-200 text-sm mt-1">📍 Região mais forte: {rec.melhorBairro}</p>
+          )}
+          {rec.confianca === "baixa" && (
+            <p className="text-amber-400 text-xs mt-2">Ainda estou aprendendo — confie no seu julgamento</p>
+          )}
+          <button
+            onClick={() => { setLevouBrow(rec.brownies); if (rec.brigadeiros > 0) setLevouBrig(rec.brigadeiros); }}
+            className="w-full mt-3 bg-indigo-600 active:bg-indigo-700 rounded-xl py-3 font-bold">
+            Usar esta sugestão
+          </button>
+        </div>
+      )}
+
       {encerrado && (
         <div className="w-full max-w-sm bg-green-900/40 border border-green-600 rounded-2xl py-3 px-4 text-center">
           <span className="text-green-300 font-bold">Dia já encerrado</span>
-          <div className="text-green-400 text-sm mt-1">Novos registros contam para hoje</div>
         </div>
       )}
 
