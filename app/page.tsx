@@ -13,6 +13,45 @@ import {
   type MotivoAmostra,
   type SessaoVenda,
 } from "./lib/coleta";
+import {
+  enfileirar,
+  listar as listarOutbox,
+  migrarFilasAntigas,
+  sincronizar,
+  temDeletePendente,
+  type ItemOutbox,
+} from "./lib/outbox";
+import { fetchJsonComTimeout } from "./lib/rede";
+
+// Envia um item da outbox ao Supabase com tempo máximo (evita envio "pendurado" para sempre).
+async function enviarItem(item: ItemOutbox) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15_000);
+  try {
+    if (item.op === "delete") {
+      return await supabase.from(item.tabela).delete().eq(item.conflito, item.payload[item.conflito] as string).abortSignal(ctrl.signal);
+    }
+    return await supabase.from(item.tabela).upsert(item.payload, { onConflict: item.conflito }).abortSignal(ctrl.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function contarPendentes() {
+  try {
+    const itens = listarOutbox(localStorage);
+    return {
+      vendas: itens.filter((x) => x.tabela === "vendas").length,
+      coleta: itens.filter((x) => x.tabela !== "vendas").length,
+    };
+  } catch {
+    return { vendas: 0, coleta: 0 };
+  }
+}
+
+function vendidosNaSessao(vendas: Venda[], sessaoId: string, produto: string) {
+  return vendas.filter((v) => v.sessaoId === sessaoId && v.produto === produto).length;
+}
 
 type Venda = {
   id: string;
@@ -139,6 +178,9 @@ export default function Home() {
   const [dataAtiva, setDataAtiva] = useState(() => hojeCDMX());
   const ultimoLocal = useRef<LocalConhecido | null>(null);
   const coletaEmAndamentoRef = useRef(false);
+  const coletaAtualRef = useRef<Promise<void> | null>(null);
+  const iniciandoRef = useRef(false);
+  const desfeitasRef = useRef(new Set<string>());
   const ultimaAmostraEm = useRef(0);
   const ultimoPontoAmostrado = useRef<{ lat: number; lon: number; quando: number } | null>(null);
 
@@ -431,24 +473,27 @@ export default function Home() {
     }
   }, []);
 
-  // ---------- FILA DE REENVIO ----------
-  const enviarPendentes = useCallback(async () => {
-    const fila = JSON.parse(localStorage.getItem("fila") || "[]");
-    if (fila.length === 0) { setPendentes(0); return; }
-    const restantes = [];
-    for (const item of fila) {
-      const { error } = await supabase.from("vendas").upsert(item, { onConflict: "cliente_id" });
-      if (error) restantes.push(item);
-    }
-    localStorage.setItem("fila", JSON.stringify(restantes));
-    setPendentes(restantes.length);
+  // ---------- FILA DE ENVIO (OUTBOX) ----------
+  // Vendas, sessões e amostras ficam salvas no aparelho até o banco confirmar.
+  const atualizarContadoresPendentes = useCallback(() => {
+    const p = contarPendentes();
+    setPendentes(p.vendas);
+    setPendentesColeta(p.coleta);
   }, []);
 
-  function adicionarNaFila(registro: Record<string, unknown>) {
-    const fila = JSON.parse(localStorage.getItem("fila") || "[]");
-    fila.push(registro);
-    localStorage.setItem("fila", JSON.stringify(fila));
-    setPendentes(fila.length);
+  const sincronizarTudo = useCallback(async () => {
+    try {
+      await sincronizar(localStorage, enviarItem);
+    } catch { /* tenta de novo no próximo ciclo */ }
+    atualizarContadoresPendentes();
+  }, [atualizarContadoresPendentes]);
+
+  function guardarESincronizar(tabela: ItemOutbox["tabela"], conflito: string, payload: Record<string, unknown>, op: ItemOutbox["op"] = "upsert") {
+    try {
+      enfileirar(localStorage, tabela, conflito, payload, op);
+    } catch { /* localStorage indisponível: ainda tenta enviar abaixo */ }
+    atualizarContadoresPendentes();
+    void sincronizarTudo();
   }
 
   // ---------- RECONCILIAÇÃO ----------
@@ -458,7 +503,8 @@ export default function Home() {
       const { data, error } = await supabase
         .from("vendas").select("cliente_id, produto, hora, data, vendido_em, sessao_id").eq("data", hoje);
       if (error || !data) return;
-      const doBanco: Venda[] = data.map((v) => ({
+      // Não ressuscita vendas que ela desfez e cujo DELETE ainda está na fila.
+      const doBanco: Venda[] = data.filter((v) => !v.cliente_id || !temDeletePendente(localStorage, "vendas", v.cliente_id)).map((v) => ({
         id: v.cliente_id || `banco-${v.hora}-${Math.random()}`,
         produto: v.produto, hora: v.hora, data: v.data,
         momento: v.vendido_em || undefined, sessaoId: v.sessao_id || null,
@@ -529,35 +575,17 @@ export default function Home() {
     localStorage.setItem("filaDias", JSON.stringify(restantes));
   }, []);
 
-  // ---------- FILA DA COLETA ML ----------
-  function enfileirarColeta(tabela: "sessoes_venda" | "amostras_venda", payload: Record<string, unknown>) {
-    const fila = JSON.parse(localStorage.getItem("filaColeta") || "[]");
-    fila.push({ tabela, payload });
-    localStorage.setItem("filaColeta", JSON.stringify(fila));
-    setPendentesColeta(fila.length);
-  }
-
-  const enviarColetaPendente = useCallback(async () => {
-    const fila: Array<{ tabela: "sessoes_venda" | "amostras_venda"; payload: Record<string, unknown> }> =
-      JSON.parse(localStorage.getItem("filaColeta") || "[]");
-    if (fila.length === 0) { setPendentesColeta(0); return; }
-    const restantes = [];
-    for (const item of fila) {
-      const { error } = await supabase.from(item.tabela).upsert(item.payload, { onConflict: "id" });
-      if (error) restantes.push(item);
-    }
-    localStorage.setItem("filaColeta", JSON.stringify(restantes));
-    setPendentesColeta(restantes.length);
-  }, []);
-
   // ---------- AO ABRIR ----------
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const salvo = localStorage.getItem("estado");
     const hoje = hojeCDMX();
+    migrarFilasAntigas(localStorage);
+    let vendasSalvas: Venda[] = [];
 
     if (salvo) {
       const e = JSON.parse(salvo);
+      vendasSalvas = Array.isArray(e.vendas) ? e.vendas : [];
       const dataSalva = e.data || hoje;
       if (e.precoBrig != null) setPrecoBrig(e.precoBrig);
       if (e.precoBrow != null) setPrecoBrow(e.precoBrow);
@@ -575,14 +603,59 @@ export default function Home() {
       if (sessaoSalva?.data === hoje) {
         setSessao(sessaoSalva);
       } else if (sessaoSalva) {
+        // Saída de um dia anterior que não foi finalizada: encerra no banco usando a
+        // última atividade conhecida neste aparelho (não o horário de agora).
+        const ultimaAmostra = Number(localStorage.getItem("ultimaAmostraEm") || 0);
+        const ultimaVenda = vendasSalvas
+          .filter((v) => v.sessaoId === sessaoSalva.id && v.momento)
+          .reduce((m, v) => Math.max(m, Date.parse(v.momento as string) || 0), 0);
+        const fim = Math.max(Date.parse(sessaoSalva.inicio) || 0, ultimaAmostra, ultimaVenda);
+        enfileirar(localStorage, "sessoes_venda", "id", {
+          id: sessaoSalva.id, data: sessaoSalva.data, inicio: sessaoSalva.inicio,
+          fim: new Date(fim).toISOString(), status: "encerrada",
+          levou_brow: sessaoSalva.levouBrow, levou_brig: sessaoSalva.levouBrig,
+          preco_brow: sessaoSalva.precoBrow, preco_brig: sessaoSalva.precoBrig,
+        });
         localStorage.removeItem("sessaoVenda");
       }
     } catch { /* estado antigo ou inválido */ }
 
     setCarregado(true);
-    setPendentes(JSON.parse(localStorage.getItem("fila") || "[]").length);
-    setPendentesColeta(JSON.parse(localStorage.getItem("filaColeta") || "[]").length);
-  }, []);
+    atualizarContadoresPendentes();
+  }, [atualizarContadoresPendentes]);
+
+  // Se o aparelho perdeu a sessão local (outra aba, armazenamento limpo), recupera do banco
+  // a saída ainda ativa de hoje em vez de deixar começar uma nova.
+  useEffect(() => {
+    if (!carregado || sessao) return;
+    let cancelado = false;
+    (async () => {
+      try {
+        const hoje = hojeCDMX();
+        const { data, error } = await supabase
+          .from("sessoes_venda")
+          .select("id, data, inicio, levou_brow, levou_brig, preco_brow, preco_brig")
+          .eq("data", hoje).eq("status", "ativa")
+          .order("inicio", { ascending: false }).limit(1);
+        if (cancelado || error || !data?.[0] || ref.current.sessao) return;
+        if (listarOutbox(localStorage).some((x) => x.chave === `sessoes_venda:${data[0].id}` && x.payload.status === "encerrada")) return;
+        const s = data[0];
+        const recuperada: SessaoVenda = {
+          id: s.id, data: s.data, inicio: s.inicio,
+          levouBrow: Number(s.levou_brow ?? 0), levouBrig: Number(s.levou_brig ?? 0),
+          precoBrow: Number(s.preco_brow ?? 0), precoBrig: Number(s.preco_brig ?? 0),
+          browniesInicio: 0, brigadeirosInicio: 0,
+        };
+        localStorage.setItem("sessaoVenda", JSON.stringify(recuperada));
+        setSessao(recuperada);
+        setAviso("Venda em andamento recuperada");
+        setTimeout(() => setAviso(null), 3000);
+      } catch { /* offline: tenta na próxima abertura */ }
+    })();
+    return () => { cancelado = true; };
+    // Só ao abrir; uma sessão iniciada aqui depois não deve disparar nova busca.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [carregado]);
 
   useEffect(() => {
     if (carregado) salvarEstadoAgora({ vendas, levouBrig, levouBrow, precoBrig, precoBrow });
@@ -590,10 +663,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!carregado) return;
-    reconciliar(); enviarPendentes(); enviarDiasPendentes(); enviarColetaPendente(); calcularRecomendacao();
-    const timer = setInterval(() => { enviarPendentes(); enviarDiasPendentes(); enviarColetaPendente(); reconciliar(); }, 60000);
-    const aoVoltar = () => { enviarPendentes(); enviarDiasPendentes(); enviarColetaPendente(); reconciliar(); };
-    const aoFocar = () => { if (document.visibilityState === "visible") reconciliar(); };
+    void sincronizarTudo().then(reconciliar); enviarDiasPendentes(); calcularRecomendacao();
+    const timer = setInterval(() => { void sincronizarTudo().then(reconciliar); enviarDiasPendentes(); }, 30000);
+    const aoVoltar = () => { void sincronizarTudo().then(reconciliar); enviarDiasPendentes(); };
+    const aoFocar = () => { if (document.visibilityState === "visible") void sincronizarTudo().then(reconciliar); };
     window.addEventListener("online", aoVoltar);
     document.addEventListener("visibilitychange", aoFocar);
     return () => {
@@ -601,7 +674,14 @@ export default function Home() {
       window.removeEventListener("online", aoVoltar);
       document.removeEventListener("visibilitychange", aoFocar);
     };
-  }, [carregado, enviarPendentes, enviarDiasPendentes, enviarColetaPendente, reconciliar, calcularRecomendacao]);
+  }, [carregado, sincronizarTudo, enviarDiasPendentes, reconciliar, calcularRecomendacao]);
+
+  // Outra aba mexeu na fila: atualiza o aviso de pendências.
+  useEffect(() => {
+    const aoMudar = (e: StorageEvent) => { if (e.key === "outbox_v1") atualizarContadoresPendentes(); };
+    window.addEventListener("storage", aoMudar);
+    return () => window.removeEventListener("storage", aoMudar);
+  }, [atualizarContadoresPendentes]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
@@ -650,7 +730,7 @@ export default function Home() {
   async function buscarClima(lat: number, lon: number) {
     try {
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation`;
-      const r = await fetch(url); const d = await r.json();
+      const d = await fetchJsonComTimeout(url, 6000);
       return { temperatura: d.current.temperature_2m, chuva: d.current.precipitation };
     } catch { return { temperatura: null, chuva: null }; }
   }
@@ -658,8 +738,8 @@ export default function Home() {
   async function buscarLocal(lat: number, lon: number) {
     try {
       const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=16&extratags=1`;
-      const r = await fetch(url, { headers: { "Accept-Language": "pt" } });
-      const d = await r.json(); const e = d.address || {};
+      const d = await fetchJsonComTimeout(url, 6000, { headers: { "Accept-Language": "pt" } });
+      const e = d.address || {};
       const bairro = e.suburb || e.borough || e.neighbourhood || e.city || null;
       const rotulo = e.road || e.pedestrian || e.square || e.neighbourhood || d.name || null;
       // Não inventa "mista" quando o reverse geocoder não tem evidência suficiente.
@@ -676,10 +756,12 @@ export default function Home() {
   function pegarLocalizacao(): Promise<{ lat: number | null; lon: number | null; precisao: number | null }> {
     return new Promise((resolve) => {
       if (!navigator.geolocation) return resolve({ lat: null, lon: null, precisao: null });
+      // Garantia extra: alguns navegadores nunca chamam o callback com a tela bloqueada.
+      setTimeout(() => resolve({ lat: null, lon: null, precisao: null }), 12_000);
       navigator.geolocation.getCurrentPosition(
         (pos) => { setGpsOk(true); resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, precisao: pos.coords.accuracy }); },
         (err) => { if (err.code === err.PERMISSION_DENIED) setGpsOk(false); resolve({ lat: null, lon: null, precisao: null }); },
-        { enableHighAccuracy: true, timeout: 20000, maximumAge: 60000 }
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
       );
     });
   }
@@ -736,42 +818,53 @@ export default function Home() {
   }
 
   async function coletarAmostra(sessaoAtual: SessaoVenda, motivo: MotivoAmostra) {
-    if (coletaEmAndamentoRef.current) return;
+    if (coletaEmAndamentoRef.current) {
+      // A amostra de fim nunca é pulada: espera a coleta em curso terminar.
+      if (motivo !== "fim") return;
+      try { await coletaAtualRef.current; } catch { /* ignora */ }
+    }
     coletaEmAndamentoRef.current = true;
     setColetandoAmostra(true);
-    try {
-      const contexto = await obterContextoLocal();
-      const estado = ref.current;
-      const totalBrow = estado.vendas.filter((v) => v.produto === "brownie").length;
-      const totalBrig = estado.vendas.filter((v) => v.produto === "brigadeiro").length;
-      const vendidosBrowSessao = Math.max(0, totalBrow - sessaoAtual.browniesInicio);
-      const vendidosBrigSessao = Math.max(0, totalBrig - sessaoAtual.brigadeirosInicio);
+    const execucao = (async () => {
+      // Horário e contadores são marcados no instante do disparo, ANTES de esperar
+      // GPS/clima/bairro. Assim uma venda feita logo depois cai no intervalo novo.
       const agora = new Date();
-
-      const amostra = {
-        id: criarId("amostra"),
+      const estado = ref.current;
+      const vendidosBrowSessao = vendidosNaSessao(estado.vendas, sessaoAtual.id, "brownie");
+      const vendidosBrigSessao = vendidosNaSessao(estado.vendas, sessaoAtual.id, "brigadeiro");
+      const id = criarId("amostra");
+      enfileirar(localStorage, "amostras_venda", "id", {
+        id,
         sessao_id: sessaoAtual.id,
         coletado_em: agora.toISOString(),
         data: hojeCDMX(agora),
         hora: horaCDMX(agora),
-        lat: contexto.lat, lon: contexto.lon, precisao: contexto.precisao,
-        bairro: contexto.bairro, tipo_area: contexto.tipoArea,
-        temperatura: contexto.temperatura, chuva: contexto.chuva,
-        local_aproximado: contexto.aproximado,
+        lat: null, lon: null, precisao: null, bairro: null, tipo_area: null,
+        temperatura: null, chuva: null, local_aproximado: false,
         estoque_brow: Math.max(0, sessaoAtual.levouBrow - vendidosBrowSessao),
         estoque_brig: Math.max(0, sessaoAtual.levouBrig - vendidosBrigSessao),
         vendidos_brow: vendidosBrowSessao,
         vendidos_brig: vendidosBrigSessao,
         motivo,
-      };
+      });
+      ultimaAmostraEm.current = agora.getTime();
+      localStorage.setItem("ultimaAmostraEm", String(ultimaAmostraEm.current));
 
-      const { error } = await supabase.from("amostras_venda").upsert(amostra, { onConflict: "id" });
-      if (error) enfileirarColeta("amostras_venda", amostra);
-      ultimaAmostraEm.current = Date.now();
+      const contexto = await obterContextoLocal();
+      guardarESincronizar("amostras_venda", "id", {
+        id,
+        lat: contexto.lat, lon: contexto.lon, precisao: contexto.precisao,
+        bairro: contexto.bairro, tipo_area: contexto.tipoArea,
+        temperatura: contexto.temperatura, chuva: contexto.chuva,
+        local_aproximado: contexto.aproximado,
+      });
       if (contexto.lat != null && contexto.lon != null) {
         ultimoPontoAmostrado.current = { lat: contexto.lat, lon: contexto.lon, quando: ultimaAmostraEm.current };
       }
-      localStorage.setItem("ultimaAmostraEm", String(ultimaAmostraEm.current));
+    })();
+    coletaAtualRef.current = execucao;
+    try {
+      await execucao;
     } finally {
       coletaEmAndamentoRef.current = false;
       setColetandoAmostra(false);
@@ -780,49 +873,50 @@ export default function Home() {
 
   async function iniciarSessao(): Promise<SessaoVenda | null> {
     if (sessao) return sessao;
+    if (iniciandoRef.current) return null; // evita duas sessões num toque duplo
     if (levouBrow <= 0 && levouBrig <= 0) {
       setAviso("Informe primeiro quantos doces ela levou");
       setTimeout(() => setAviso(null), 3000);
       return null;
     }
+    iniciandoRef.current = true;
+    try {
+      const nova: SessaoVenda = {
+        id: criarId("sessao"),
+        data: hojeCDMX(),
+        inicio: new Date().toISOString(),
+        levouBrow, levouBrig, precoBrow, precoBrig,
+        browniesInicio: 0,
+        brigadeirosInicio: 0,
+      };
 
-    const nova: SessaoVenda = {
-      id: criarId("sessao"),
-      data: hojeCDMX(),
-      inicio: new Date().toISOString(),
-      levouBrow, levouBrig, precoBrow, precoBrig,
-      browniesInicio: vendas.filter((v) => v.produto === "brownie").length,
-      brigadeirosInicio: vendas.filter((v) => v.produto === "brigadeiro").length,
-    };
-
-    const registro = {
-      id: nova.id, data: nova.data, inicio: nova.inicio, fim: null, status: "ativa",
-      levou_brow: nova.levouBrow, levou_brig: nova.levouBrig,
-      preco_brow: nova.precoBrow, preco_brig: nova.precoBrig,
-    };
-
-    setSessao(nova);
-    ultimaAmostraEm.current = Date.now();
-    ultimoPontoAmostrado.current = null;
-    localStorage.setItem("sessaoVenda", JSON.stringify(nova));
-    const { error } = await supabase.from("sessoes_venda").upsert(registro, { onConflict: "id" });
-    if (error) enfileirarColeta("sessoes_venda", registro);
-    await coletarAmostra(nova, "inicio");
-    setAviso("Vendas iniciadas");
-    setTimeout(() => setAviso(null), 2500);
-    return nova;
+      setSessao(nova);
+      ultimaAmostraEm.current = Date.now();
+      ultimoPontoAmostrado.current = null;
+      localStorage.setItem("sessaoVenda", JSON.stringify(nova));
+      guardarESincronizar("sessoes_venda", "id", {
+        id: nova.id, data: nova.data, inicio: nova.inicio, fim: null, status: "ativa",
+        levou_brow: nova.levouBrow, levou_brig: nova.levouBrig,
+        preco_brow: nova.precoBrow, preco_brig: nova.precoBrig,
+      });
+      void coletarAmostra(nova, "inicio");
+      setAviso("Vendas iniciadas");
+      setTimeout(() => setAviso(null), 2500);
+      return nova;
+    } finally {
+      iniciandoRef.current = false;
+    }
   }
 
   async function encerrarSessao(silencioso = false) {
-    if (!sessao) return;
-    await coletarAmostra(sessao, "fim");
-    const registro = {
-      id: sessao.id, data: sessao.data, inicio: sessao.inicio, fim: new Date().toISOString(), status: "encerrada",
-      levou_brow: sessao.levouBrow, levou_brig: sessao.levouBrig,
-      preco_brow: sessao.precoBrow, preco_brig: sessao.precoBrig,
-    };
-    const { error } = await supabase.from("sessoes_venda").upsert(registro, { onConflict: "id" });
-    if (error) enfileirarColeta("sessoes_venda", registro);
+    const atual = sessao;
+    if (!atual) return;
+    await coletarAmostra(atual, "fim");
+    guardarESincronizar("sessoes_venda", "id", {
+      id: atual.id, data: atual.data, inicio: atual.inicio, fim: new Date().toISOString(), status: "encerrada",
+      levou_brow: atual.levouBrow, levou_brig: atual.levouBrig,
+      preco_brow: atual.precoBrow, preco_brig: atual.precoBrig,
+    });
     setSessao(null);
     localStorage.removeItem("sessaoVenda");
     if (!silencioso) {
@@ -875,24 +969,30 @@ export default function Home() {
 
   // ---------- REGISTRO ----------
   async function completarRegistro(venda: Venda, preco: number) {
-    const contexto = await obterContextoLocal();
     const momento = venda.momento || new Date().toISOString();
-    const registro = {
+    // 1) A venda é salva no aparelho imediatamente, antes de qualquer rede.
+    try {
+      enfileirar(localStorage, "vendas", "cliente_id", {
+        cliente_id: venda.id, produto: venda.produto, hora: venda.hora, data: venda.data,
+        vendido_em: momento, sessao_id: venda.sessaoId || null, preco,
+        feriado: ehFeriado(venda.data), dia_semana: diaSemanaDaData(venda.data), periodo: periodoCDMX(new Date(momento)),
+      });
+    } catch { /* sem localStorage: segue e tenta enviar com contexto */ }
+    atualizarContadoresPendentes();
+    // 2) Contexto (GPS, clima, bairro) com tempo máximo; depois envia tudo junto.
+    const contexto = await obterContextoLocal();
+    if (desfeitasRef.current.has(venda.id)) return;
+    guardarESincronizar("vendas", "cliente_id", {
       cliente_id: venda.id, produto: venda.produto, hora: venda.hora, data: venda.data,
-      vendido_em: momento, sessao_id: venda.sessaoId || null,
-      preco, lat: contexto.lat, lon: contexto.lon, bairro: contexto.bairro, tipo_area: contexto.tipoArea,
+      vendido_em: momento, sessao_id: venda.sessaoId || null, preco,
+      lat: contexto.lat, lon: contexto.lon, bairro: contexto.bairro, tipo_area: contexto.tipoArea,
       temperatura: contexto.temperatura, chuva: contexto.chuva, precisao: contexto.precisao,
       local_aproximado: contexto.aproximado,
-      feriado: ehFeriado(venda.data), dia_semana: diaSemanaDaData(venda.data), periodo: periodoCDMX(new Date(momento)),
-    };
-    const { error } = await supabase.from("vendas").upsert(registro, { onConflict: "cliente_id" });
-    if (error) adicionarNaFila(registro);
+    });
   }
 
   async function registrar(produto: string) {
-    const vendidosProdutoDia = vendas.filter((v) => v.produto === produto).length;
-    const inicioProduto = sessao ? (produto === "brownie" ? sessao.browniesInicio : sessao.brigadeirosInicio) : vendidosProdutoDia;
-    const vendidosProdutoSessao = Math.max(0, vendidosProdutoDia - inicioProduto);
+    const vendidosProdutoSessao = sessao ? vendidosNaSessao(vendas, sessao.id, produto) : 0;
     const estoqueInformado = produto === "brownie" ? levouBrow : levouBrig;
     if (estoqueInformado <= vendidosProdutoSessao) {
       setAviso("Ajuste primeiro a quantidade de doces levados");
@@ -928,6 +1028,7 @@ export default function Home() {
   async function desfazer() {
     if (!ultimaVenda) return;
     const id = ultimaVenda.id;
+    desfeitasRef.current.add(id);
     setVendas((atual) => {
       const novas = atual.filter((v) => v.id !== id);
       salvarEstadoAgora({ ...ref.current, vendas: novas });
@@ -936,11 +1037,8 @@ export default function Home() {
     setUltimaVenda(null); setAviso("Desfeito");
     setTimeout(() => setAviso(null), 1500);
     if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
-    const fila = JSON.parse(localStorage.getItem("fila") || "[]");
-    const novaFila = fila.filter((f: { cliente_id?: string }) => f.cliente_id !== id);
-    localStorage.setItem("fila", JSON.stringify(novaFila));
-    setPendentes(novaFila.length);
-    await supabase.from("vendas").delete().eq("cliente_id", id);
+    // O DELETE entra na mesma fila, depois do envio da venda: a ordem fica garantida.
+    guardarESincronizar("vendas", "cliente_id", { cliente_id: id }, "delete");
   }
 
   const brigadeiros = vendas.filter((v) => v.produto === "brigadeiro").length;
@@ -949,8 +1047,9 @@ export default function Home() {
   const minutosSessao = sessao
     ? minutosEntre(sessao.inicio, new Date(agoraTick || Date.parse(sessao.inicio)))
     : 0;
-  const browniesSessao = sessao ? Math.max(0, brownies - sessao.browniesInicio) : 0;
-  const brigadeirosSessao = sessao ? Math.max(0, brigadeiros - sessao.brigadeirosInicio) : 0;
+  // Conta pelas vendas vinculadas à sessão (não por subtração do total do dia).
+  const browniesSessao = sessao ? vendidosNaSessao(vendas, sessao.id, "brownie") : 0;
+  const brigadeirosSessao = sessao ? vendidosNaSessao(vendas, sessao.id, "brigadeiro") : 0;
   const faturamentoSessao = browniesSessao * precoBrow + brigadeirosSessao * precoBrig;
   const taxaBrowniesHora = minutosSessao >= 5 ? browniesSessao * 60 / minutosSessao : 0;
   const vendasBrownieSessao = sessao
@@ -978,6 +1077,7 @@ export default function Home() {
     };
 
     await encerrarSessao(true);
+    await sincronizarTudo(); // garante que as vendas pendentes cheguem antes do resumo
     const ok = await atualizarResumoDia(hojeCDMX());
     setBalancoFinal(resumo);
     // Mantém as vendas do dia para a próxima sessão começar do ponto correto,
