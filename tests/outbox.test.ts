@@ -1,7 +1,7 @@
 // Rodar: node --experimental-strip-types --test tests/outbox.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { enfileirar, listar, migrarFilasAntigas, sincronizar, temDeletePendente, type ItemOutbox } from "../app/lib/outbox.ts";
+import { enfileirar, liberarEsperas, listar, migrarFilasAntigas, sincronizar, temDeletePendente, type ItemOutbox } from "../app/lib/outbox.ts";
 
 function memoria() {
   const m = new Map<string, string>();
@@ -117,4 +117,34 @@ test("localStorage corrompido não quebra a fila", () => {
   assert.deepEqual(listar(s), []);
   enfileirar(s, "vendas", "cliente_id", { cliente_id: "A" });
   assert.equal(listar(s).length, 1);
+});
+
+test("venda aguardando GPS não é enviada antes da hora; o contexto libera o envio", async () => {
+  const s = memoria();
+  const enviados: Array<Record<string, unknown>> = [];
+  const enviar = async (i: ItemOutbox) => { enviados.push({ ...i.payload }); return { error: null }; };
+  enfileirar(s, "vendas", "cliente_id", { cliente_id: "A", produto: "brownie" }, "upsert", Date.now() + 60_000);
+  await sincronizar(s, enviar);
+  assert.equal(enviados.length, 0);
+  enfileirar(s, "vendas", "cliente_id", { cliente_id: "A", bairro: "Coyoacán" });
+  await sincronizar(s, enviar);
+  assert.deepEqual(enviados, [{ cliente_id: "A", produto: "brownie", bairro: "Coyoacán" }]);
+  assert.equal(listar(s).length, 0);
+});
+
+test("venda que ficou sem contexto (página fechada) é enviada depois do prazo", async () => {
+  const s = memoria();
+  let n = 0;
+  enfileirar(s, "vendas", "cliente_id", { cliente_id: "A" }, "upsert", Date.now() - 1);
+  await sincronizar(s, async () => { n++; return { error: null }; });
+  assert.equal(n, 1);
+});
+
+test("ao reabrir o app, itens que esperavam GPS são liberados", async () => {
+  const s = memoria();
+  enfileirar(s, "amostras_venda", "id", { id: "a1" }, "upsert", Date.now() + 60_000);
+  liberarEsperas(s);
+  let n = 0;
+  await sincronizar(s, async () => { n++; return { error: null }; });
+  assert.equal(n, 1);
 });

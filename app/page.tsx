@@ -15,6 +15,7 @@ import {
 } from "./lib/coleta";
 import {
   enfileirar,
+  liberarEsperas,
   listar as listarOutbox,
   migrarFilasAntigas,
   sincronizar,
@@ -31,7 +32,10 @@ async function enviarItem(item: ItemOutbox) {
     if (item.op === "delete") {
       return await supabase.from(item.tabela).delete().eq(item.conflito, item.payload[item.conflito] as string).abortSignal(ctrl.signal);
     }
-    return await supabase.from(item.tabela).upsert(item.payload, { onConflict: item.conflito }).abortSignal(ctrl.signal);
+    // Vendas: a tabela não permite UPDATE para o app (RLS). Por isso cada venda é enviada
+    // uma única vez, já completa, e um reenvio de algo que já chegou é ignorado em vez de dar erro.
+    const ignorarDuplicadas = item.tabela === "vendas";
+    return await supabase.from(item.tabela).upsert(item.payload, { onConflict: item.conflito, ignoreDuplicates: ignorarDuplicadas }).abortSignal(ctrl.signal);
   } finally {
     clearTimeout(timer);
   }
@@ -581,6 +585,7 @@ export default function Home() {
     const salvo = localStorage.getItem("estado");
     const hoje = hojeCDMX();
     migrarFilasAntigas(localStorage);
+    liberarEsperas(localStorage); // a página que ia completar GPS/bairro não existe mais
     let vendasSalvas: Venda[] = [];
 
     if (salvo) {
@@ -833,7 +838,7 @@ export default function Home() {
       const vendidosBrowSessao = vendidosNaSessao(estado.vendas, sessaoAtual.id, "brownie");
       const vendidosBrigSessao = vendidosNaSessao(estado.vendas, sessaoAtual.id, "brigadeiro");
       const id = criarId("amostra");
-      enfileirar(localStorage, "amostras_venda", "id", {
+      const base = {
         id,
         sessao_id: sessaoAtual.id,
         coletado_em: agora.toISOString(),
@@ -846,13 +851,16 @@ export default function Home() {
         vendidos_brow: vendidosBrowSessao,
         vendidos_brig: vendidosBrigSessao,
         motivo,
-      });
+      };
+      // Guarda já (sobrevive a recarga); espera o GPS por até 30 s antes de enviar.
+      enfileirar(localStorage, "amostras_venda", "id", base, "upsert", Date.now() + 30_000);
       ultimaAmostraEm.current = agora.getTime();
       localStorage.setItem("ultimaAmostraEm", String(ultimaAmostraEm.current));
 
       const contexto = await obterContextoLocal();
+      // Sempre o registro COMPLETO: um envio parcial seria recusado pelo banco (colunas obrigatórias).
       guardarESincronizar("amostras_venda", "id", {
-        id,
+        ...base,
         lat: contexto.lat, lon: contexto.lon, precisao: contexto.precisao,
         bairro: contexto.bairro, tipo_area: contexto.tipoArea,
         temperatura: contexto.temperatura, chuva: contexto.chuva,
@@ -976,7 +984,7 @@ export default function Home() {
         cliente_id: venda.id, produto: venda.produto, hora: venda.hora, data: venda.data,
         vendido_em: momento, sessao_id: venda.sessaoId || null, preco,
         feriado: ehFeriado(venda.data), dia_semana: diaSemanaDaData(venda.data), periodo: periodoCDMX(new Date(momento)),
-      });
+      }, "upsert", Date.now() + 30_000); // espera o GPS/bairro; se a página morrer, envia sem eles depois
     } catch { /* sem localStorage: segue e tenta enviar com contexto */ }
     atualizarContadoresPendentes();
     // 2) Contexto (GPS, clima, bairro) com tempo máximo; depois envia tudo junto.

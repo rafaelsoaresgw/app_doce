@@ -19,6 +19,8 @@ export type ItemOutbox = {
   rev: number;
   criadoEm: number;
   tentativas: number;
+  /** Não enviar antes deste instante (ms). Usado para esperar GPS/bairro da venda. */
+  naoAntesDe?: number;
 };
 
 export interface Armazenamento {
@@ -58,6 +60,7 @@ export function enfileirar(
   conflito: string,
   payload: Record<string, unknown>,
   op: Operacao = "upsert",
+  naoAntesDe = 0,
 ): number {
   const itens = listar(s);
   const chave = chaveDe(tabela, conflito, payload);
@@ -69,12 +72,13 @@ export function enfileirar(
       op,
       payload: op === "delete" ? { [conflito]: payload[conflito] } : { ...atual.payload, ...payload },
       rev: atual.rev + 1,
+      naoAntesDe,
     };
     itens[i] = novo;
     gravar(s, itens);
     return novo.rev;
   }
-  itens.push({ chave, tabela, conflito, op, payload: op === "delete" ? { [conflito]: payload[conflito] } : payload, rev: 1, criadoEm: Date.now(), tentativas: 0 });
+  itens.push({ chave, tabela, conflito, op, payload: op === "delete" ? { [conflito]: payload[conflito] } : payload, rev: 1, criadoEm: Date.now(), tentativas: 0, naoAntesDe });
   gravar(s, itens);
   return 1;
 }
@@ -112,7 +116,7 @@ export function sincronizar(s: Armazenamento, enviar: Enviar): Promise<number> {
     const tentados = new Map<string, number>();
     for (let voltas = 0; voltas < 500; voltas++) {
       const proximo = listar(s)
-        .filter((x) => tentados.get(x.chave) !== x.rev)
+        .filter((x) => tentados.get(x.chave) !== x.rev && !((x.naoAntesDe ?? 0) > Date.now()))
         .sort((a, b) => PRIORIDADE[a.tabela] - PRIORIDADE[b.tabela] || a.criadoEm - b.criadoEm)[0];
       if (!proximo) break;
       tentados.set(proximo.chave, proximo.rev);
@@ -137,6 +141,12 @@ export function sincronizar(s: Armazenamento, enviar: Enviar): Promise<number> {
     emAndamento = null;
   });
   return emAndamento;
+}
+
+/** Ao abrir o app: itens que esperavam GPS de uma página anterior podem ser enviados já. */
+export function liberarEsperas(s: Armazenamento) {
+  const itens = listar(s);
+  if (itens.some((x) => (x.naoAntesDe ?? 0) > 0)) gravar(s, itens.map((x) => ({ ...x, naoAntesDe: 0 })));
 }
 
 /** Move as filas da versão anterior ("fila" e "filaColeta") para a outbox. */

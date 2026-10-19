@@ -5,6 +5,8 @@ const APP = "http://localhost:3100";
 const db = { vendas: [], sessoes_venda: [], amostras_venda: [], dias: [], ml_intervalos_v2: [] };
 let supabaseOnline = true;
 let atrasoUpsertVendas = 0;
+let perderRespostaVendas = 0; // simula: o banco grava, mas a resposta se perde na rede
+let errosRls = 0;
 const resultados = [];
 const ok = (nome, cond, extra = "") => { resultados.push({ nome, ok: !!cond, extra }); console.log(`${cond ? "PASSOU" : "FALHOU"} - ${nome}${extra ? " :: " + extra : ""}`); };
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -43,8 +45,16 @@ async function instalarMocks(ctx) {
           return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "23503", message: "fk" }) });
         }
         const i = linhas.findIndex((x) => x[chave] === r[chave]);
+        const ignorar = (req.headers()["prefer"] || "").includes("resolution=ignore-duplicates");
+        if (i >= 0 && tabela === "vendas" && !ignorar) {
+          // Igual ao banco real: vendas não tem política de UPDATE para anon.
+          errosRls++;
+          return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ code: "42501", message: "new row violates row-level security policy" }) });
+        }
+        if (i >= 0 && ignorar) continue;
         if (i >= 0) linhas[i] = { ...linhas[i], ...r }; else linhas.push({ ...r, _criado: Date.now() });
       }
+      if (tabela === "vendas" && perderRespostaVendas > 0) { perderRespostaVendas--; return route.abort("connectionreset"); }
       return route.fulfill({ status: 201, contentType: "application/json", body: "" });
     }
     if (req.method() === "DELETE") {
@@ -79,7 +89,7 @@ try {
 
   // 1. Início de sessão
   const inp = p.locator('input[type="number"]').nth(1);
-  await inp.fill("10");
+  await inp.fill("20");
   await botao(p, /Começar vendas/).click();
   await p.getByText("Vendas em andamento").waitFor();
   await aguardar(() => db.sessoes_venda.length === 1 && db.amostras_venda.length === 1);
@@ -94,13 +104,13 @@ try {
   // 3. Recarregar a página
   await p.reload({ waitUntil: "networkidle" });
   await p.getByText("Vendas em andamento").waitFor();
-  ok("3. Após recarregar, a sessão continua e o contador mostra 3/10", JSON.stringify(await contador(p)) === "[3,10]", JSON.stringify(await contador(p)));
+  ok("3. Após recarregar, a sessão continua e o contador mostra 3/20", JSON.stringify(await contador(p)) === "[3,20]", JSON.stringify(await contador(p)));
 
   // 4. Queda de conexão
   supabaseOnline = false;
   await brownie(p).click(); await brownie(p).click();
   await p.getByText(/venda\(s\) pendente/).waitFor({ timeout: 20000 });
-  ok("4a. Sem internet: contador 5/10 e aviso de pendentes", JSON.stringify(await contador(p)) === "[5,10]");
+  ok("4a. Sem internet: contador 5/20 e aviso de pendentes", JSON.stringify(await contador(p)) === "[5,20]");
   await p.reload({ waitUntil: "domcontentloaded" });
   await p.getByText("Vendas em andamento").waitFor();
   const outbox = await p.evaluate(() => JSON.parse(localStorage.getItem("outbox_v1") || "[]").filter((x) => x.tabela === "vendas").length);
@@ -119,7 +129,7 @@ try {
   await espera(8000);
   ok("5. Desfazer durante envio lento: a venda desfeita não fica no banco", vendasDb().length === 5, `banco=${vendasDb().length}`);
   await p.reload({ waitUntil: "networkidle" });
-  ok("5b. Após recarregar, a venda desfeita não volta ao contador", JSON.stringify(await contador(p)) === "[5,10]", JSON.stringify(await contador(p)));
+  ok("5b. Após recarregar, a venda desfeita não volta ao contador", JSON.stringify(await contador(p)) === "[5,20]", JSON.stringify(await contador(p)));
 
   // 6. Duas abas
   const p2 = await ctx.newPage(); p2.on("dialog", (d) => d.accept());
@@ -131,6 +141,22 @@ try {
   ok("6. Duas abas: mesma sessão, vendas das duas chegam sem duplicar", vendasDb().length === 7 && db.sessoes_venda.length === 1 && vendasDb().every((v) => v.sessao_id === sid), `banco=${vendasDb().length} sessoes=${db.sessoes_venda.length}`);
   await p2.close();
 
+  // 6b. Resposta perdida: a venda chega ao banco, o app acha que falhou e reenvia
+  perderRespostaVendas = 1;
+  await brownie(p).click();
+  await aguardar(() => vendasDb().length === 8);
+  await p.evaluate(() => window.dispatchEvent(new Event("online")));
+  await espera(3000);
+  const pend = await p.evaluate(() => JSON.parse(localStorage.getItem("outbox_v1") || "[]").length);
+  ok("6b. Reenvio de venda que já chegou não trava a fila (sem erro de permissão)", vendasDb().length === 8 && pend === 0 && errosRls === 0, `banco=${vendasDb().length} fila=${pend} rls=${errosRls}`);
+
+  // 6c. Várias vendas seguidas (um cliente leva 3)
+  for (let i = 0; i < 3; i++) await brownie(p).click();
+  await aguardar(() => vendasDb().length === 11);
+  await espera(2000);
+  const pend2 = await p.evaluate(() => JSON.parse(localStorage.getItem("outbox_v1") || "[]").length);
+  ok("6c. 3 vendas seguidas chegam completas (com bairro) e a fila esvazia", vendasDb().length === 11 && vendasDb().every((v) => v.bairro) && pend2 === 0 && errosRls === 0, `banco=${vendasDb().length} fila=${pend2} rls=${errosRls}`);
+
   // 7. Armazenamento local perdido -> recupera do banco
   const ctxB = await novoContexto();
   const pB = await ctxB.newPage(); pB.on("dialog", (d) => d.accept());
@@ -138,7 +164,7 @@ try {
   await pB.getByText("Vendas em andamento").waitFor({ timeout: 15000 }).catch(() => {});
   const recuperou = await pB.getByText("Vendas em andamento").isVisible();
   await espera(1500);
-  ok("7. Outro navegador / localStorage limpo: recupera a sessão ativa do banco", recuperou && JSON.stringify(await contador(pB)) === "[7,10]" && db.sessoes_venda.length === 1, JSON.stringify(await contador(pB)));
+  ok("7. Outro navegador / localStorage limpo: recupera a sessão ativa do banco", recuperou && JSON.stringify(await contador(pB)) === "[11,20]" && db.sessoes_venda.length === 1, JSON.stringify(await contador(pB)));
   await ctxB.close();
 
   // 8. Encerramento
@@ -147,8 +173,8 @@ try {
   await p.getByText("Resumo das vendas").waitFor({ timeout: 30000 });
   await aguardar(() => db.sessoes_venda[0].status === "encerrada" && db.dias.length === 1);
   const fimAm = db.amostras_venda.filter((a) => a.motivo === "fim");
-  ok("8. Finalizar: sessão encerrada com fim, amostra de fim e resumo do dia = 7", db.sessoes_venda[0].status === "encerrada" && db.sessoes_venda[0].fim && fimAm.length === 1 && db.dias[0]?.vendeu_brow === 7, `dias=${JSON.stringify(db.dias[0]?.vendeu_brow)} fim=${fimAm.length}`);
-  ok("8b. Contadores das amostras batem com eventos (nunca acima)", db.amostras_venda.every((a) => a.vendidos_brow <= 7) && fimAm[0]?.vendidos_brow === 7, db.amostras_venda.map((a) => a.motivo + ":" + a.vendidos_brow).join(","));
+  ok("8. Finalizar: sessão encerrada com fim, amostra de fim e resumo do dia = 11", db.sessoes_venda[0].status === "encerrada" && db.sessoes_venda[0].fim && fimAm.length === 1 && db.dias[0]?.vendeu_brow === 11, `dias=${JSON.stringify(db.dias[0]?.vendeu_brow)} fim=${fimAm.length}`);
+  ok("8b. Contadores das amostras batem com eventos (nunca acima)", db.amostras_venda.every((a) => a.vendidos_brow <= 11) && fimAm[0]?.vendidos_brow === 11, db.amostras_venda.map((a) => a.motivo + ":" + a.vendidos_brow).join(","));
 
   // 9. Sessão de dia anterior esquecida aberta
   const ctxC = await novoContexto();
