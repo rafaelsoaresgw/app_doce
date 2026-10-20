@@ -104,39 +104,54 @@ export function temDeletePendente(s: Armazenamento, tabela: Tabela, id: string) 
 }
 
 let emAndamento: Promise<number> | null = null;
+let repetir = false;
+
+async function rodada(s: Armazenamento, enviar: Enviar): Promise<number> {
+  const tentados = new Map<string, number>();
+  for (let voltas = 0; voltas < 500; voltas++) {
+    const proximo = listar(s)
+      .filter((x) => tentados.get(x.chave) !== x.rev && !((x.naoAntesDe ?? 0) > Date.now()))
+      .sort((a, b) => PRIORIDADE[a.tabela] - PRIORIDADE[b.tabela] || a.criadoEm - b.criadoEm)[0];
+    if (!proximo) break;
+    tentados.set(proximo.chave, proximo.rev);
+    let erro: unknown = null;
+    try {
+      erro = (await enviar(proximo)).error;
+    } catch (e) {
+      erro = e ?? "erro";
+    }
+    if (erro) {
+      marcarTentativa(s, proximo.chave);
+      // Se uma sessão falhou, amostras dela também falhariam (chave estrangeira).
+      if (proximo.tabela === "sessoes_venda") {
+        for (const x of listar(s)) if (x.tabela === "amostras_venda") tentados.set(x.chave, x.rev);
+      }
+    } else {
+      confirmar(s, proximo.chave, proximo.rev);
+    }
+  }
+  return listar(s).length;
+}
 
 /**
  * Envia tudo que estiver pendente, um item por vez. Chamadas simultâneas na mesma aba
- * reaproveitam o envio em curso. Itens adicionados durante o envio também são enviados.
- * Retorna quantos itens continuam pendentes.
+ * reaproveitam o envio em curso; se alguém pedir envio durante uma rodada (ex.: a internet
+ * voltou), uma nova rodada é feita logo em seguida. Retorna quantos itens continuam pendentes.
  */
 export function sincronizar(s: Armazenamento, enviar: Enviar): Promise<number> {
-  if (emAndamento) return emAndamento;
+  if (emAndamento) {
+    repetir = true;
+    return emAndamento;
+  }
   emAndamento = (async () => {
-    const tentados = new Map<string, number>();
-    for (let voltas = 0; voltas < 500; voltas++) {
-      const proximo = listar(s)
-        .filter((x) => tentados.get(x.chave) !== x.rev && !((x.naoAntesDe ?? 0) > Date.now()))
-        .sort((a, b) => PRIORIDADE[a.tabela] - PRIORIDADE[b.tabela] || a.criadoEm - b.criadoEm)[0];
-      if (!proximo) break;
-      tentados.set(proximo.chave, proximo.rev);
-      let erro: unknown = null;
-      try {
-        erro = (await enviar(proximo)).error;
-      } catch (e) {
-        erro = e ?? "erro";
-      }
-      if (erro) {
-        marcarTentativa(s, proximo.chave);
-        // Se uma sessão falhou, amostras dela também falhariam (chave estrangeira).
-        if (proximo.tabela === "sessoes_venda") {
-          for (const x of listar(s)) if (x.tabela === "amostras_venda") tentados.set(x.chave, x.rev);
-        }
-      } else {
-        confirmar(s, proximo.chave, proximo.rev);
-      }
-    }
-    return listar(s).length;
+    let restantes = 0;
+    let rodadas = 0;
+    do {
+      repetir = false;
+      restantes = await rodada(s, enviar);
+      rodadas++;
+    } while (repetir && restantes > 0 && rodadas < 10);
+    return restantes;
   })().finally(() => {
     emAndamento = null;
   });

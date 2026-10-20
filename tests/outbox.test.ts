@@ -148,3 +148,15 @@ test("ao reabrir o app, itens que esperavam GPS são liberados", async () => {
   await sincronizar(s, async () => { n++; return { error: null }; });
   assert.equal(n, 1);
 });
+
+test("pedido de envio durante uma rodada que falhava gera nova rodada (internet voltou)", async () => {
+  const s = memoria();
+  let online = false;
+  enfileirar(s, "vendas", "cliente_id", { cliente_id: "A" });
+  const envio = sincronizar(s, async () => { await espera(30); return { error: online ? null : "offline" }; });
+  await espera(10);
+  online = true;
+  void sincronizar(s, async () => ({ error: null })); // ex.: evento "online"
+  await envio;
+  assert.equal(listar(s).length, 0);
+});

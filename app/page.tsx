@@ -720,6 +720,14 @@ export default function Home() {
     };
   }, [dataAtiva, sessao, precoBrig, precoBrow, calcularRecomendacao]);
 
+  // Permite abrir o app sem internet (cópia local da página). Só em produção.
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production" || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("/sw.js")
+      .then((r) => { if (navigator.onLine) void r.update(); })
+      .catch(() => { /* navegador sem suporte: app segue funcionando online */ });
+  }, []);
+
   // Evita fechar/recarregar a página sem querer enquanto existe uma venda em andamento.
   useEffect(() => {
     if (!sessao) return;
@@ -868,6 +876,10 @@ export default function Home() {
       });
       if (contexto.lat != null && contexto.lon != null) {
         ultimoPontoAmostrado.current = { lat: contexto.lat, lon: contexto.lon, quando: ultimaAmostraEm.current };
+      } else if (motivo !== "fim") {
+        // GPS ainda sem sinal (comum logo no início): tenta outra amostra em ~1 minuto.
+        ultimaAmostraEm.current = Date.now() - 2 * 60 * 1000;
+        localStorage.setItem("ultimaAmostraEm", String(ultimaAmostraEm.current));
       }
     })();
     coletaAtualRef.current = execucao;
@@ -948,6 +960,9 @@ export default function Home() {
     };
 
     const timer = setInterval(verificarColeta, 60_000);
+    // Ao abrir/reabrir a página (ex.: o celular fechou a aba em segundo plano), verifica já,
+    // sem esperar o primeiro minuto — senão uma venda feita logo em seguida fica sem amostra.
+    verificarColeta();
     const aoFocar = () => { if (document.visibilityState === "visible") verificarColeta(); };
     document.addEventListener("visibilitychange", aoFocar);
     return () => {
